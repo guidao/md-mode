@@ -909,6 +909,76 @@
       (md-mode)
       (should-not truncate-lines))))
 
+(ert-deftest md-mode-render-wrap-lines-defaults-to-horizontal-scroll ()
+  (with-temp-buffer
+    (insert "A long paragraph that remains a single rendered line.\n")
+    (md-mode)
+    (md-mode-render)
+    (should-not md-render-wrap-lines)
+    (should truncate-lines)))
+
+(ert-deftest md-mode-render-wrap-lines-wraps-rendered-buffer ()
+  (let ((md-render-wrap-lines t)
+        (md-mode-clip-wide-tables nil))
+    (with-temp-buffer
+      (let ((partial-width truncate-partial-width-windows))
+        (insert "A long paragraph that should wrap in the rendered view.\n")
+        (md-mode)
+        (md-mode-render)
+        (should md-mode--rendered-p)
+        (should-not truncate-lines)
+        (should word-wrap)
+        (should-not truncate-partial-width-windows)
+        ;; The jit-lock refresh must not undo the rendered-view setting.
+        (md-mode--truncate-tables-in-region (point-min) (point-max))
+        (should-not truncate-lines)
+        (md-mode-show-source)
+        (should-not md-mode--rendered-p)
+        (should-not word-wrap)
+        (should (equal truncate-partial-width-windows partial-width))
+        (should (equal (buffer-string)
+                       "A long paragraph that should wrap in the rendered view.\n"))))))
+
+(ert-deftest md-mode-render-visual-line-mode-survives-table-refresh ()
+  (let ((md-render-wrap-lines nil)
+        (md-mode-clip-wide-tables nil))
+    (with-temp-buffer
+      (insert "- A long list item that should wrap with Visual Line mode.\n")
+      (md-mode)
+      (md-mode-render)
+      (visual-line-mode 1)
+      (md-mode--truncate-tables-in-region (point-min) (point-max))
+      (should-not truncate-lines)
+      (should word-wrap)
+      (should (equal (get-text-property (point-min) 'wrap-prefix) "  "))
+      (visual-line-mode -1)
+      (should truncate-lines)
+      (should-not (get-text-property (point-min) 'wrap-prefix)))))
+
+(ert-deftest md-mode-render-wrap-lines-indents-list-and-heading-continuations ()
+  (let ((md-render-wrap-lines t))
+    (with-temp-buffer
+      (insert (concat "# A heading whose continuation keeps heading context.\n"
+                      "## A level two heading keeps its own context too.\n"
+                      "- A bullet whose continuation aligns with its text.\n"
+                      "12. An ordered item whose continuation aligns too.\n"))
+      (md-mode)
+      (md-mode-render)
+      (goto-char (point-min))
+      (let ((prefix (get-text-property (point) 'wrap-prefix)))
+        (should (equal (substring-no-properties prefix) " "))
+        (should (eq (get-text-property 0 'face prefix)
+                    'md-render-header-1)))
+      (forward-line 1)
+      (let ((prefix (get-text-property (point) 'wrap-prefix)))
+        (should (equal (substring-no-properties prefix) "  "))
+        (should (eq (get-text-property 0 'face prefix)
+                    'md-render-header-2)))
+      (forward-line 1)
+      (should (equal (get-text-property (point) 'wrap-prefix) "  "))
+      (forward-line 1)
+      (should (equal (get-text-property (point) 'wrap-prefix) "    ")))))
+
 (ert-deftest md-mode-aligns-table-padding-by-pixel-width ()
   (with-temp-buffer
     (let ((md-mode-auto-align-tables nil))

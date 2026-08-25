@@ -178,6 +178,25 @@
   "Face for level-6 headers rendered by `md-render-convert'."
   :group 'md-render)
 
+(defconst md-render--header-faces
+  '(md-render-header-1
+    md-render-header-2
+    md-render-header-3
+    md-render-header-4
+    md-render-header-5
+    md-render-header-6)
+  "Faces that identify rendered Markdown heading levels.")
+
+(defconst md-render--list-prefix-regexp
+  (rx bol
+      (group
+       (zero-or-more (any " 	"))
+       (or (seq (any "-+*") (one-or-more blank))
+           (seq (one-or-more digit)
+                (any ".)")
+                (one-or-more blank)))))
+  "Regexp matching the visible prefix of a rendered list item.")
+
 (defface md-render-table-header
   '((t :inherit bold))
   "Face for table header row content."
@@ -226,12 +245,14 @@ When nil, fall back to ASCII pipes and dashes."
   :type 'boolean
   :group 'md-render)
 
-(defcustom md-render-table-wrap-columns nil
+(defcustom md-render-table-wrap-columns t
   "When non-nil, wrap table columns to fit within window width.
 
-When nil (the default), tables render at their natural width —
-wide tables overflow the window edge and the view follows the
-cursor as it moves right (auto-hscroll)."
+Wide tables shrink to `md-render-table-max-width-fraction' of the
+window and long cells wrap onto several lines.  When nil, tables
+render at their natural width — wide tables overflow the window
+edge and the view follows the cursor as it moves right
+\(auto-hscroll)."
   :type 'boolean
   :group 'md-render)
 
@@ -1863,6 +1884,73 @@ with `emacs-lisp-mode' face properties on the body and a
               ;; loop doesn't backtrack into body content (e.g. shorter
               ;; inner fences inside a wider outer fence).
               (goto-char (marker-position body-end)))))))))
+
+(defun md-render--clear-wrap-prefixes ()
+  "Remove continuation prefixes previously added by the renderer."
+  (let ((position (point-min))
+        (limit (point-max)))
+    (while (< position limit)
+      (if (get-text-property position 'md-render-wrap-prefix)
+          (let ((end (or (next-single-property-change
+                         position 'md-render-wrap-prefix nil limit)
+                         limit)))
+            (remove-text-properties
+             position end '(wrap-prefix nil md-render-wrap-prefix nil))
+            (setq position end))
+        (setq position
+              (or (next-single-property-change
+                   position 'md-render-wrap-prefix nil limit)
+                  limit))))))
+
+(defun md-render--header-face-at (start end)
+  "Return the rendered heading face between START and END, if any."
+  (let ((position start)
+        header-face)
+    (while (and (< position end)
+                (not header-face))
+      (let ((face (get-text-property position 'face)))
+        (setq header-face
+              (seq-find
+               (lambda (candidate)
+                 (memq candidate md-render--header-faces))
+               (if (listp face) face (list face)))))
+      (setq position (1+ position)))
+    header-face))
+
+(defun md-render--wrap-prefix-for-line (start end)
+  "Return the continuation prefix for the rendered line START..END."
+  (save-excursion
+    (goto-char start)
+    (unless (or (get-text-property start 'md-render-frozen)
+                (get-text-property start 'line-prefix)
+                (get-text-property start 'wrap-prefix))
+      (cond
+       ((looking-at md-render--list-prefix-regexp)
+        (make-string
+         (string-width (match-string-no-properties 1))
+         ?\ ))
+       ((when-let* ((header-face (md-render--header-face-at start end)))
+          (let* ((name (symbol-name header-face))
+                 (level (string-to-number
+                         (substring name (length "md-render-header-")))))
+            (propertize (make-string level ?\ )
+                        'face header-face))))))))
+
+(defun md-render--apply-wrap-prefixes (enabled)
+  "Apply rendered continuation prefixes when ENABLED is non-nil."
+  (with-silent-modifications
+    (md-render--clear-wrap-prefixes)
+    (when enabled
+      (save-excursion
+        (goto-char (point-min))
+        (while (< (point) (point-max))
+          (let* ((start (point))
+                 (end (line-end-position))
+                 (prefix (md-render--wrap-prefix-for-line start end)))
+            (when prefix
+              (put-text-property start end 'wrap-prefix prefix)
+              (put-text-property start end 'md-render-wrap-prefix t)))
+          (forward-line 1))))))
 
 (defconst md-render--table-line-regexp
   (rx line-start

@@ -49,6 +49,9 @@
   "Edit and render Markdown buffers."
   :group 'text)
 
+(defvar-local md-mode--rendered-p nil
+  "Non-nil when the current buffer displays rendered Markdown.")
+
 (defcustom md-mode-auto-align-tables t
   "When non-nil, align Markdown tables when entering `md-mode'."
   :type 'boolean
@@ -83,6 +86,22 @@ just tables."
              (when (derived-mode-p 'md-mode)
                (md-mode--apply-table-clipping))))))
 
+(defcustom md-render-wrap-lines nil
+  "When non-nil, wrap long lines in rendered Markdown views.
+
+Rendered lines use word wrapping and continuation prefixes that keep
+list items aligned with their content and preserve heading context.
+When nil, rendered views retain their horizontal-scrolling behavior."
+  :type 'boolean
+  :group 'md-render
+  :set (lambda (symbol value)
+         (set-default symbol value)
+         (dolist (buffer (buffer-list))
+           (with-current-buffer buffer
+             (when (and (derived-mode-p 'md-mode)
+                        md-mode--rendered-p)
+               (md-mode--apply-rendered-wrapping))))))
+
 (defcustom md-mode-use-markdown-mode-faces t
   "When non-nil, reuse available `markdown-mode' faces.
 
@@ -112,8 +131,17 @@ not load or require `markdown-mode'."
   "Face for editable Markdown delimiters."
   :group 'md)
 
-(defvar-local md-mode--rendered-p nil
-  "Non-nil when the current buffer displays rendered Markdown.")
+(defvar-local md-mode--render-word-wrap nil
+  "Value of `word-wrap' saved before entering rendered Markdown view.")
+
+(defvar-local md-mode--render-word-wrap-saved-p nil
+  "Non-nil when `md-mode--render-word-wrap' contains a saved value.")
+
+(defvar-local md-mode--render-truncate-partial-width-windows nil
+  "Value of `truncate-partial-width-windows' saved before rendering.")
+
+(defvar-local md-mode--render-truncate-partial-width-windows-saved-p nil
+  "Non-nil when the partial-width truncation value was saved.")
 
 (defvar-local md-mode--toc-buffer nil
   "Table of contents buffer associated with this Markdown buffer.")
@@ -1610,8 +1638,14 @@ are then left to overflow the window edge instead."
 
 Also keeps `truncate-lines' in step with `md-mode-clip-wide-tables'
 — this runs from jit-lock, so buffers enabled by older versions of
-the mode self-heal on the next fontification."
-  (let ((wanted (not md-mode-clip-wide-tables)))
+the mode self-heal on the next fontification.  Rendered buffers
+also keep wrapping enabled by `md-render-wrap-lines' or
+`visual-line-mode'."
+  (let ((wanted (if (and md-mode--rendered-p
+                         (or md-render-wrap-lines
+                             (bound-and-true-p visual-line-mode)))
+                    nil
+                  (not md-mode-clip-wide-tables))))
     (unless (eq truncate-lines wanted)
       (setq-local truncate-lines wanted)))
   (let ((regions (md-mode--table-regions start end)))
@@ -1633,9 +1667,32 @@ the mode self-heal on the next fontification."
 
 Wide rows must overflow the window edge to be reachable by
 horizontal scrolling, so `truncate-lines' is enabled whenever
-clipping is off.  Applies to both the edit and the rendered
-view."
+clipping is off, except when rendered line wrapping is enabled.
+Applies to both the edit and the rendered view."
   (md-mode--truncate-tables-in-buffer))
+
+(defun md-mode--apply-rendered-wrapping ()
+  "Apply `md-render-wrap-lines' to the current rendered buffer."
+  (when md-mode--rendered-p
+    (let ((wrap-lines-p (or md-render-wrap-lines
+                            (bound-and-true-p visual-line-mode))))
+      (setq-local truncate-lines
+                  (if wrap-lines-p
+                      nil
+                    (not md-mode-clip-wide-tables)))
+      (setq-local word-wrap
+                  (if wrap-lines-p
+                      t
+                    (if md-mode--render-word-wrap-saved-p
+                        md-mode--render-word-wrap
+                      word-wrap)))
+      (setq-local truncate-partial-width-windows
+                  (if wrap-lines-p
+                      nil
+                    (if md-mode--render-truncate-partial-width-windows-saved-p
+                        md-mode--render-truncate-partial-width-windows
+                      truncate-partial-width-windows)))
+      (md-render--apply-wrap-prefixes wrap-lines-p))))
 
 (defun md-mode--stop-table-overflow ()
   "Stop refreshing and remove table overflow overlays."
@@ -1724,15 +1781,37 @@ view."
 
 (defun md-mode--set-rendered-p (rendered)
   "Set the current buffer's rendered state to RENDERED."
-  (setq md-mode--rendered-p rendered
-        buffer-read-only rendered
-        mode-name (if rendered "MD View" "MD")
-        font-lock-extra-managed-props
-        (if rendered
-            (delq 'display font-lock-extra-managed-props)
-          (cons 'display
-                (delq 'display font-lock-extra-managed-props))))
-  (force-mode-line-update))
+  (let ((was-rendered md-mode--rendered-p))
+    (setq md-mode--rendered-p rendered
+          buffer-read-only rendered
+          mode-name (if rendered "MD View" "MD")
+          font-lock-extra-managed-props
+          (if rendered
+              (delq 'display font-lock-extra-managed-props)
+            (cons 'display
+                  (delq 'display font-lock-extra-managed-props))))
+    (cond
+     ((and rendered (not was-rendered))
+      (setq-local md-mode--render-word-wrap word-wrap
+                  md-mode--render-word-wrap-saved-p t
+                  md-mode--render-truncate-partial-width-windows
+                  truncate-partial-width-windows
+                  md-mode--render-truncate-partial-width-windows-saved-p t)
+      (md-mode--apply-rendered-wrapping))
+     ((and (not rendered) was-rendered)
+      (when md-mode--render-word-wrap-saved-p
+        (setq-local word-wrap md-mode--render-word-wrap
+                    md-mode--render-word-wrap-saved-p nil))
+      (when md-mode--render-truncate-partial-width-windows-saved-p
+        (setq-local
+         truncate-partial-width-windows
+         md-mode--render-truncate-partial-width-windows
+         md-mode--render-truncate-partial-width-windows-saved-p nil))
+      (setq-local truncate-lines
+                  (if (bound-and-true-p visual-line-mode)
+                      nil
+                    (not md-mode-clip-wide-tables)))))
+    (force-mode-line-update)))
 
 (defun md-mode--escaped-p (position)
   "Return non-nil when the character at POSITION is escaped."
@@ -2356,6 +2435,8 @@ view."
             #'md-mode--truncate-tables-in-buffer nil t)
   (add-hook 'text-scale-mode-hook
             #'md-mode--truncate-tables-in-buffer nil t)
+  (add-hook 'visual-line-mode-hook
+            #'md-mode--apply-rendered-wrapping nil t)
   (jit-lock-register #'md-mode--truncate-tables-in-region)
   (md-mode--auto-align-tables)
   (md-mode--fold-initial-front-matter)
