@@ -44,6 +44,8 @@
 (require 'text-property-search)
 
 (declare-function hel-keymap-local-set "hel-core" (&rest args))
+(declare-function md-render-apply-continuation-layout
+  "md-render" (&key enabled))
 
 (defgroup md nil
   "Edit and render Markdown buffers."
@@ -142,6 +144,12 @@ not load or require `markdown-mode'."
 
 (defvar-local md-mode--render-truncate-partial-width-windows-saved-p nil
   "Non-nil when the partial-width truncation value was saved.")
+
+(defvar-local md-mode--render-visual-line nil
+  "Value of `visual-line-mode' saved before rendering.")
+
+(defvar-local md-mode--render-visual-line-saved-p nil
+  "Non-nil when `md-mode--render-visual-line' contains a saved value.")
 
 (defvar-local md-mode--toc-buffer nil
   "Table of contents buffer associated with this Markdown buffer.")
@@ -1609,9 +1617,10 @@ When the region is active, use its lines as the callout body."
 (defun md-mode--add-table-overflow (start end window)
   "Add table overflow overlays between START and END for WINDOW.
 
-Does nothing when `md-mode-clip-wide-tables' is nil — wide rows
-are then left to overflow the window edge instead."
-  (when md-mode-clip-wide-tables
+Does nothing when `md-mode-clip-wide-tables' is nil or line
+wrapping is enabled — wrapped rows remain fully visible."
+  (when (and md-mode-clip-wide-tables
+             (not (md-mode--view-wrap-lines-p)))
     (with-selected-window window
     (save-excursion
       (goto-char start)
@@ -1633,6 +1642,17 @@ are then left to overflow the window edge instead."
               (overlay-put overlay 'evaporate t))))
         (forward-line 1))))))
 
+(defun md-mode--view-wrap-lines-p ()
+  "Return non-nil when the current view should wrap logical lines."
+  (or (bound-and-true-p visual-line-mode)
+      (and md-mode--rendered-p md-render-wrap-lines)))
+
+(defun md-mode--desired-truncate-lines ()
+  "Return the `truncate-lines' value for the current view policy."
+  (if (md-mode--view-wrap-lines-p)
+      nil
+    (not md-mode-clip-wide-tables)))
+
 (defun md-mode--truncate-tables-in-region (start end)
   "Refresh wide table overlays between START and END.
 
@@ -1641,11 +1661,7 @@ Also keeps `truncate-lines' in step with `md-mode-clip-wide-tables'
 the mode self-heal on the next fontification.  Rendered buffers
 also keep wrapping enabled by `md-render-wrap-lines' or
 `visual-line-mode'."
-  (let ((wanted (if (and md-mode--rendered-p
-                         (or md-render-wrap-lines
-                             (bound-and-true-p visual-line-mode)))
-                    nil
-                  (not md-mode-clip-wide-tables))))
+  (let ((wanted (md-mode--desired-truncate-lines)))
     (unless (eq truncate-lines wanted)
       (setq-local truncate-lines wanted)))
   (let ((regions (md-mode--table-regions start end)))
@@ -1667,32 +1683,34 @@ also keep wrapping enabled by `md-render-wrap-lines' or
 
 Wide rows must overflow the window edge to be reachable by
 horizontal scrolling, so `truncate-lines' is enabled whenever
-clipping is off, except when rendered line wrapping is enabled.
+clipping is off, except when either view's line wrapping is enabled.
 Applies to both the edit and the rendered view."
   (md-mode--truncate-tables-in-buffer))
 
 (defun md-mode--apply-rendered-wrapping ()
   "Apply `md-render-wrap-lines' to the current rendered buffer."
   (when md-mode--rendered-p
-    (let ((wrap-lines-p (or md-render-wrap-lines
-                            (bound-and-true-p visual-line-mode))))
-      (setq-local truncate-lines
-                  (if wrap-lines-p
-                      nil
-                    (not md-mode-clip-wide-tables)))
+    (let* ((wrap-lines-p (md-mode--view-wrap-lines-p))
+           (restore-source-display-p
+            (or (not md-mode--render-visual-line-saved-p)
+                (eq (bound-and-true-p visual-line-mode)
+                    md-mode--render-visual-line))))
+      (setq-local truncate-lines (md-mode--desired-truncate-lines))
       (setq-local word-wrap
                   (if wrap-lines-p
                       t
-                    (if md-mode--render-word-wrap-saved-p
+                    (if (and restore-source-display-p
+                             md-mode--render-word-wrap-saved-p)
                         md-mode--render-word-wrap
                       word-wrap)))
       (setq-local truncate-partial-width-windows
                   (if wrap-lines-p
                       nil
-                    (if md-mode--render-truncate-partial-width-windows-saved-p
+                    (if (and restore-source-display-p
+                             md-mode--render-truncate-partial-width-windows-saved-p)
                         md-mode--render-truncate-partial-width-windows
                       truncate-partial-width-windows)))
-      (md-render--apply-wrap-prefixes wrap-lines-p))))
+      (md-render-apply-continuation-layout :enabled wrap-lines-p))))
 
 (defun md-mode--stop-table-overflow ()
   "Stop refreshing and remove table overflow overlays."
@@ -1796,21 +1814,28 @@ Applies to both the edit and the rendered view."
                   md-mode--render-word-wrap-saved-p t
                   md-mode--render-truncate-partial-width-windows
                   truncate-partial-width-windows
-                  md-mode--render-truncate-partial-width-windows-saved-p t)
+                  md-mode--render-truncate-partial-width-windows-saved-p t
+                  md-mode--render-visual-line
+                  (bound-and-true-p visual-line-mode)
+                  md-mode--render-visual-line-saved-p t)
       (md-mode--apply-rendered-wrapping))
      ((and (not rendered) was-rendered)
-      (when md-mode--render-word-wrap-saved-p
-        (setq-local word-wrap md-mode--render-word-wrap
-                    md-mode--render-word-wrap-saved-p nil))
-      (when md-mode--render-truncate-partial-width-windows-saved-p
-        (setq-local
-         truncate-partial-width-windows
-         md-mode--render-truncate-partial-width-windows
-         md-mode--render-truncate-partial-width-windows-saved-p nil))
-      (setq-local truncate-lines
-                  (if (bound-and-true-p visual-line-mode)
-                      nil
-                    (not md-mode-clip-wide-tables)))))
+      (let ((restore-source-display-p
+             (or (not md-mode--render-visual-line-saved-p)
+                 (eq (bound-and-true-p visual-line-mode)
+                     md-mode--render-visual-line))))
+        (when (and restore-source-display-p
+                   md-mode--render-word-wrap-saved-p)
+          (setq-local word-wrap md-mode--render-word-wrap))
+        (when (and restore-source-display-p
+                   md-mode--render-truncate-partial-width-windows-saved-p)
+          (setq-local
+           truncate-partial-width-windows
+           md-mode--render-truncate-partial-width-windows))
+        (setq-local md-mode--render-word-wrap-saved-p nil
+                    md-mode--render-truncate-partial-width-windows-saved-p nil
+                    md-mode--render-visual-line-saved-p nil))
+      (setq-local truncate-lines (md-mode--desired-truncate-lines))))
     (force-mode-line-update)))
 
 (defun md-mode--escaped-p (position)

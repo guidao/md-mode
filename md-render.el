@@ -178,15 +178,6 @@
   "Face for level-6 headers rendered by `md-render-convert'."
   :group 'md-render)
 
-(defconst md-render--header-faces
-  '(md-render-header-1
-    md-render-header-2
-    md-render-header-3
-    md-render-header-4
-    md-render-header-5
-    md-render-header-6)
-  "Faces that identify rendered Markdown heading levels.")
-
 (defconst md-render--list-prefix-regexp
   (rx bol
       (group
@@ -489,6 +480,9 @@ body un-fontified."
           (avoid-ranges))
       (save-restriction
         (narrow-to-region watermark (point-max))
+        (with-silent-modifications
+          (md-render--clear-wrap-prefixes)
+          (md-render--clear-line-context))
         ;; Build the render context (fenced-block descriptors + inline
         ;; `code' ranges) once, via the same function any external code
         ;; renders a static region through, so the two cannot drift.
@@ -552,6 +546,9 @@ body un-fontified."
         ;; always sees the existing `md-render-table-source'
         ;; needed to fold new rows in.
         (md-render--style-tables :avoid-ranges source-ranges)
+        ;; Keep the structural facts needed by the display layout adapter
+        ;; separate from the faces produced by the styling passes.
+        (md-render--annotate-line-context :avoid-ranges avoid-ranges)
         ;; Mirror every `face' we composed onto `font-lock-face' so our
         ;; styling survives `font-lock-mode' re-fontification — comint
         ;; / shell-maker / agent-shell buffers fontify on every output
@@ -1213,6 +1210,8 @@ with face `md-render-header-2' on \"My title\"."
         (if avoid
             (goto-char (cdr avoid))
           (let* ((level (- (match-end 1) (match-beginning 1)))
+                 (face (intern (format "md-render-header-%d"
+                                       (min (max level 1) 6))))
                  (text (buffer-substring (match-beginning 2) (match-end 2)))
                  (source (unless (get-text-property markup-start
                                                     'md-render-source)
@@ -1230,10 +1229,12 @@ with face `md-render-header-2' on \"My title\"."
               (insert "\n")
               (when newline-properties
                 (add-text-properties end (point) newline-properties))
-              (add-face-text-property
-               markup-start end
-               (intern (format "md-render-header-%d"
-                               (min (max level 1) 6))))
+              (add-face-text-property markup-start end face)
+              (put-text-property
+               markup-start end 'md-render-line-context
+               (list :kind 'heading
+                     :level (min (max level 1) 6)
+                     :face face))
               (when source
                 (put-text-property markup-start end
                                    'md-render-source source)))))))))
@@ -1902,42 +1903,65 @@ with `emacs-lisp-mode' face properties on the body and a
                    position 'md-render-wrap-prefix nil limit)
                   limit))))))
 
-(defun md-render--header-face-at (start end)
-  "Return the rendered heading face between START and END, if any."
-  (let ((position start)
-        header-face)
-    (while (and (< position end)
-                (not header-face))
-      (let ((face (get-text-property position 'face)))
-        (setq header-face
-              (seq-find
-               (lambda (candidate)
-                 (memq candidate md-render--header-faces))
-               (if (listp face) face (list face)))))
-      (setq position (1+ position)))
-    header-face))
+(defun md-render--clear-line-context ()
+  "Remove renderer-owned line context from the current region."
+  (remove-text-properties (point-min) (point-max)
+                          '(md-render-line-context nil)))
 
-(defun md-render--wrap-prefix-for-line (start end)
-  "Return the continuation prefix for the rendered line START..END."
+(cl-defun md-render--annotate-line-context (&key avoid-ranges)
+  "Annotate rendered list lines with continuation layout context.
+
+Heading context is attached by the heading pass, where its level is
+known.  A list marker remains visible, so its display width is recorded
+here without consulting the line's faces.  A line whose first character
+belongs to AVOID-RANGES is left alone; this keeps incomplete fenced
+blocks and externally frozen regions out of the generic layout path."
+  (save-excursion
+    (goto-char (point-min))
+    (while (< (point) (point-max))
+      (let* ((start (point))
+             (end (line-end-position)))
+        (unless (or (= start end)
+                    (get-text-property start 'md-render-frozen)
+                    (get-text-property start 'line-prefix)
+                    (get-text-property start 'wrap-prefix)
+                    (get-text-property start 'md-render-line-context)
+                    (md-render-in-avoid-range-p
+                     start (min (1+ start) end) avoid-ranges))
+          (when (looking-at md-render--list-prefix-regexp)
+            (put-text-property
+             start (1+ start) 'md-render-line-context
+             (list :kind 'list
+                   :width (string-width
+                           (match-string-no-properties 1)))))))
+      (forward-line 1))))
+
+(defun md-render--wrap-prefix-for-line (start _end)
+  "Return the continuation prefix for the rendered line at START."
   (save-excursion
     (goto-char start)
     (unless (or (get-text-property start 'md-render-frozen)
                 (get-text-property start 'line-prefix)
                 (get-text-property start 'wrap-prefix))
-      (cond
-       ((looking-at md-render--list-prefix-regexp)
-        (make-string
-         (string-width (match-string-no-properties 1))
-         ?\ ))
-       ((when-let* ((header-face (md-render--header-face-at start end)))
-          (let* ((name (symbol-name header-face))
-                 (level (string-to-number
-                         (substring name (length "md-render-header-")))))
-            (propertize (make-string level ?\ )
-                        'face header-face))))))))
+      (when-let* ((context (get-text-property
+                            start 'md-render-line-context)))
+        (pcase (plist-get context :kind)
+          ('list
+           (make-string (plist-get context :width) ?\ ))
+          ('heading
+           (propertize
+            (make-string (plist-get context :level) ?\ )
+            'face (plist-get context :face))))))))
 
-(defun md-render--apply-wrap-prefixes (enabled)
-  "Apply rendered continuation prefixes when ENABLED is non-nil."
+(cl-defun md-render-apply-continuation-layout (&key enabled)
+  "Apply rendered continuation prefixes when ENABLED is non-nil.
+
+This consumes the `md-render-line-context' metadata produced by the
+renderer passes.
+
+This renderer seam changes only text properties.  Buffer display
+variables such as `truncate-lines' and `word-wrap' remain the
+responsibility of the mode that owns the rendered view."
   (with-silent-modifications
     (md-render--clear-wrap-prefixes)
     (when enabled
@@ -1951,6 +1975,10 @@ with `emacs-lisp-mode' face properties on the body and a
               (put-text-property start end 'wrap-prefix prefix)
               (put-text-property start end 'md-render-wrap-prefix t)))
           (forward-line 1))))))
+
+(defun md-render--apply-wrap-prefixes (enabled)
+  "Compatibility wrapper applying continuation layout for ENABLED."
+  (md-render-apply-continuation-layout :enabled enabled))
 
 (defconst md-render--table-line-regexp
   (rx line-start
@@ -2834,6 +2862,8 @@ rendered region from inheriting either of our two properties."
 Filters out presentation properties such as `face', `font-lock-face',
 and `display', plus rendering properties such as `md-render-frozen',
 `md-render-table-source', `md-render-source', and `rear-nonsticky'.
+It also filters generic layout state such as `wrap-prefix',
+`md-render-wrap-prefix', and `md-render-line-context'.
 This lets application-level properties such as read-only state and
 agent-shell block ids survive on the rendered output."
   (let ((props (text-properties-at pos))
@@ -2844,6 +2874,9 @@ agent-shell block ids survive on the rendered output."
         (unless (memq key '(face
                             font-lock-face
                             display
+                            wrap-prefix
+                            md-render-wrap-prefix
+                            md-render-line-context
                             md-render-frozen
                             md-render-table-source
                             md-render-source

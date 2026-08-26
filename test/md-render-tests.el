@@ -16,6 +16,46 @@
                              (file-name-directory
                               (or load-file-name buffer-file-name))))
 
+(ert-deftest md-render-apply-continuation-layout-is-a-narrow-seam ()
+  (with-temp-buffer
+    (insert "- A rendered list item.\n")
+    (md-render-replace-markup :force t :render-images nil)
+    (let ((truncate-lines t)
+          (word-wrap nil)
+          (truncate-partial-width-windows t))
+      (md-render-apply-continuation-layout :enabled t)
+      (should (equal (get-text-property (point-min) 'wrap-prefix) "  "))
+      (should truncate-lines)
+      (should-not word-wrap)
+      (should truncate-partial-width-windows)
+      (md-render-apply-continuation-layout :enabled nil)
+      (should-not (get-text-property (point-min) 'wrap-prefix)))))
+
+(ert-deftest md-render-layout-does-not-infer-heading-from-face ()
+  (with-temp-buffer
+    (insert "Plain text with a heading-like face.\n")
+    (put-text-property (point-min) (line-end-position)
+                       'face 'md-render-header-1)
+    (md-render-apply-continuation-layout :enabled t)
+    (should-not (get-text-property (point-min) 'wrap-prefix))))
+
+(ert-deftest md-render-carry-properties-drops-generic-layout-state ()
+  (with-temp-buffer
+    (insert "x")
+    (add-text-properties
+     (point-min) (point-max)
+     '(field keep
+       line-prefix "  "
+       wrap-prefix "old"
+       md-render-wrap-prefix t
+       md-render-line-context (:kind list :width 2)))
+    (let ((carried (md-render--carry-properties (point-min))))
+      (should (equal (plist-get carried 'field) 'keep))
+      (should (equal (plist-get carried 'line-prefix) "  "))
+      (should-not (memq 'wrap-prefix carried))
+      (should-not (memq 'md-render-wrap-prefix carried))
+      (should-not (memq 'md-render-line-context carried)))))
+
 (ert-deftest md-render-convert-bold ()
   (should (equal (md-render--deconstruct
                   (md-render-convert "hello **world**"))

@@ -917,6 +917,61 @@
     (should-not md-render-wrap-lines)
     (should truncate-lines)))
 
+(ert-deftest md-mode-visual-line-mode-wraps-edit-view ()
+  (let ((md-mode-clip-wide-tables nil))
+    (with-temp-buffer
+      (insert (concat "A long source paragraph that should wrap in edit view.\n"
+                      "| A | B |\n"
+                      "|---|---|\n"
+                      "| x | y |\n"))
+      (md-mode)
+      (visual-line-mode 1)
+      (should visual-line-mode)
+      (should-not truncate-lines)
+      ;; The real jit-lock/table refresh must not undo Visual Line mode.
+      (md-mode--truncate-tables-in-region (point-min) (point-max))
+      (should-not truncate-lines)
+      (md-mode--truncate-tables-in-buffer)
+      (should-not truncate-lines)
+      (visual-line-mode -1)
+      (should-not visual-line-mode)
+      (should truncate-lines))))
+
+(ert-deftest md-mode-visual-line-mode-wraps-edit-screen-lines ()
+  (let ((md-mode-clip-wide-tables nil))
+    (save-window-excursion
+      (with-temp-buffer
+        (let ((window (selected-window)))
+          (set-window-buffer window (current-buffer))
+          (insert (concat "A source paragraph "
+                          (mapconcat #'identity (make-list 200 "word") " ")
+                          "\n"))
+          (md-mode)
+          (visual-line-mode 1)
+          (set-window-start window (point-min))
+          (should (> (count-screen-lines (point-min) (point-max)
+                                         nil window)
+                     1)))))))
+
+(ert-deftest md-mode-rendered-visual-line-toggle-restores-current-source-policy ()
+  (let ((md-render-wrap-lines nil)
+        (md-mode-clip-wide-tables nil)
+        (word-wrap nil)
+        (truncate-partial-width-windows t))
+    (with-temp-buffer
+      (insert "A source paragraph whose view policy changes.\n")
+      (md-mode)
+      (visual-line-mode 1)
+      (should visual-line-mode)
+      (should word-wrap)
+      (md-mode-render)
+      (visual-line-mode -1)
+      (should-not visual-line-mode)
+      (md-mode-show-source)
+      (should-not visual-line-mode)
+      (should-not word-wrap)
+      (should truncate-partial-width-windows))))
+
 (ert-deftest md-mode-render-wrap-lines-wraps-rendered-buffer ()
   (let ((md-render-wrap-lines t)
         (md-mode-clip-wide-tables nil))
@@ -938,6 +993,22 @@
         (should (equal truncate-partial-width-windows partial-width))
         (should (equal (buffer-string)
                        "A long paragraph that should wrap in the rendered view.\n"))))))
+
+(ert-deftest md-mode-render-wrap-lines-wraps-screen-lines ()
+  (let ((md-render-wrap-lines t))
+    (save-window-excursion
+      (with-temp-buffer
+        (let ((window (selected-window)))
+          (set-window-buffer window (current-buffer))
+          (insert (concat "A rendered paragraph "
+                          (mapconcat #'identity (make-list 200 "word") " ")
+                          "\n"))
+          (md-mode)
+          (md-mode-render)
+          (set-window-start window (point-min))
+          (should (> (count-screen-lines (point-min) (point-max)
+                                         nil window)
+                     1)))))))
 
 (ert-deftest md-mode-render-visual-line-mode-survives-table-refresh ()
   (let ((md-render-wrap-lines nil)
