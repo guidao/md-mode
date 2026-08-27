@@ -4,7 +4,7 @@
 
 ;; Author: LuciusChen
 ;; URL: https://github.com/yibie/md-mode
-;; Version: 0.2.1
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: wp, convenience
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -224,6 +224,28 @@ not load or require `markdown-mode'."
   "C-c C-i" #'md-mode-insert-image
   "C-c C-s" md-mode-style-map
   "C-c C-v" #'md-mode-toggle-markup)
+
+(defvar-keymap md-render-view-map
+  :doc "Keymap active while an `md-mode' buffer shows rendered Markdown."
+  "SPC" #'scroll-up-command
+  "DEL" #'scroll-down-command
+  "S-SPC" #'scroll-down-command
+  "n" #'md-mode-next-heading
+  "p" #'md-mode-previous-heading
+  "TAB" #'md-render-view-next-heading
+  "<tab>" #'md-render-view-next-heading
+  "g" #'md-mode-refresh-render)
+
+(define-minor-mode md-render-view-mode
+  "Enable the keymap for a read-only rendered Markdown view.
+
+This minor mode is managed by `md-mode--set-rendered-p' and is not an
+independent editing mode."
+  :init-value nil
+  :lighter nil
+  :keymap md-render-view-map
+  :interactive nil
+  :group 'md)
 
 (defvar-keymap md-mode--link-map
   :doc "Keymap for opening Markdown links."
@@ -454,26 +476,62 @@ ignored."
   "Return the Markdown heading level at point."
   (length (match-string 1)))
 
+(defun md-mode--rendered-heading-positions ()
+  "Return buffer positions of headings in a rendered view."
+  (let (positions)
+    (save-excursion
+      (goto-char (point-min))
+      (while-let ((match (text-property-search-forward
+                          'md-render-source)))
+        (let ((source (prop-match-value match)))
+          (when (and (stringp source)
+                     (string-match md-mode--heading-regexp source)
+                     (= (match-beginning 0) 0))
+            (push (prop-match-beginning match) positions)))))
+    (nreverse positions)))
+
+(defun md-mode--move-rendered-heading (direction count)
+  "Move across COUNT rendered headings in DIRECTION."
+  (let* ((line-start (line-beginning-position))
+         (positions (md-mode--rendered-heading-positions))
+         (candidates
+          (if (> direction 0)
+              (seq-filter (lambda (position)
+                            (> position (point)))
+                          positions)
+            (nreverse
+             (seq-filter (lambda (position)
+                           (< position line-start))
+                         positions))))
+         (target (nth (1- count) candidates)))
+    (if target
+        (goto-char target)
+      (user-error "No %s heading"
+                  (if (> direction 0) "next" "previous")))))
+
 (defun md-mode--move-heading (direction count)
   "Move across COUNT Markdown headings in DIRECTION."
   (when (< count 0)
     (setq direction (- direction)
           count (- count)))
-  (let ((origin (point))
-        found)
-    (dotimes (_ count)
-      (if (> direction 0)
-          (when (save-excursion
-                  (beginning-of-line)
-                  (looking-at md-mode--heading-regexp))
-            (end-of-line))
-        (beginning-of-line))
-      (setq found (md-mode--find-heading direction))
-      (unless found
-        (goto-char origin)
-        (user-error "No %s heading"
-                    (if (> direction 0) "next" "previous")))
-      (goto-char found))))
+  (if md-mode--rendered-p
+      (unless (zerop count)
+        (md-mode--move-rendered-heading direction count))
+    (let ((origin (point))
+          found)
+      (dotimes (_ count)
+        (if (> direction 0)
+            (when (save-excursion
+                    (beginning-of-line)
+                    (looking-at md-mode--heading-regexp))
+              (end-of-line))
+          (beginning-of-line))
+        (setq found (md-mode--find-heading direction))
+        (unless found
+          (goto-char origin)
+          (user-error "No %s heading"
+                      (if (> direction 0) "next" "previous")))
+        (goto-char found)))))
 
 ;;;###autoload
 (defun md-mode-next-heading (&optional count)
@@ -488,6 +546,20 @@ ignored."
   (interactive "p")
   (md-mode--ensure-mode)
   (md-mode--move-heading -1 (or count 1)))
+
+;;;###autoload
+(defun md-render-view-next-heading ()
+  "Move to the next heading, wrapping to the first in rendered view."
+  (interactive)
+  (md-mode--ensure-mode)
+  (unless md-mode--rendered-p
+    (user-error "Not in rendered view"))
+  (condition-case nil
+      (md-mode-next-heading)
+    (user-error
+     (if-let* ((first (car (md-mode--rendered-heading-positions))))
+         (goto-char first)
+       (user-error "No heading")))))
 
 (defun md-mode--heading-level-at-point ()
   "Return the heading level at point, or nil."
@@ -869,10 +941,8 @@ ignored."
     (save-excursion
       (goto-char (point-min))
       (if md-mode--rendered-p
-          (while-let
-              ((match (text-property-search-forward
-                       'md-render-source)))
-            (let ((source (prop-match-value match)))
+          (dolist (position (md-mode--rendered-heading-positions))
+            (let ((source (get-text-property position 'md-render-source)))
               (when (and (stringp source)
                          (string-match md-mode--heading-regexp source)
                          (= (match-beginning 0) 0))
@@ -881,7 +951,7 @@ ignored."
                                (substring source (match-end 0)))
                        :level (length (match-string 1 source))
                        :marker (copy-marker
-                                (prop-match-beginning match)))
+                                position))
                       entries))))
         (while (md-mode--outline-search)
           (let* ((level (length (match-string 1)))
@@ -1808,6 +1878,7 @@ Applies to both the edit and the rendered view."
               (delq 'display font-lock-extra-managed-props)
             (cons 'display
                   (delq 'display font-lock-extra-managed-props))))
+    (md-render-view-mode (if rendered 1 -1))
     (cond
      ((and rendered (not was-rendered))
       (setq-local md-mode--render-word-wrap word-wrap
@@ -2379,6 +2450,16 @@ Applies to both the edit and the rendered view."
       (goto-char (min source-point (point-max)))
       (set-buffer-modified-p modified)
       (md-mode--refresh-toc))))
+
+;;;###autoload
+(defun md-mode-refresh-render ()
+  "Refresh the rendered view from the current Markdown source."
+  (interactive)
+  (md-mode--ensure-mode)
+  (unless md-mode--rendered-p
+    (user-error "Not in rendered view"))
+  (md-mode-show-source)
+  (md-mode-render))
 
 ;;;###autoload
 (defun md-mode-toggle-markup ()

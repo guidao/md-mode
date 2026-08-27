@@ -145,6 +145,21 @@ styled as you type.
 | C-c @             | Mark the current subtree                          |
 | M-h               | Mark the current structural element               |
 
+### Rendered view
+
+After `C-c C-v`, the buffer is read-only and these reading-oriented
+bindings take precedence over the editing bindings.  They disappear when
+the source view is restored.
+
+| Key        | Action                                      |
+|------------|---------------------------------------------|
+| SPC        | Scroll down one page                         |
+| DEL / S-SPC | Scroll up one page                           |
+| n / p      | Move to the next / previous heading          |
+| TAB        | Move to the next heading, wrapping to first  |
+| g          | Re-render from the current Markdown source  |
+| C-c C-v    | Return to the editable source view           |
+
 ### Lists and tasks
 
 | Key              | Action                                   |
