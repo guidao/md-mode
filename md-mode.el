@@ -3,12 +3,12 @@
 ;; Copyright (C) 2026 LuciusChen
 
 ;; Author: LuciusChen
+;; Assisted-by: Codex:gpt-5.5
 ;; URL: https://github.com/yibie/md-mode
 ;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: wp, convenience
 ;; SPDX-License-Identifier: GPL-3.0-or-later
-;; Assisted-by: Codex:gpt-5.5
 
 ;; This file is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
