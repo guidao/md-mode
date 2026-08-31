@@ -1918,7 +1918,7 @@ belongs to AVOID-RANGES is left alone; this keeps incomplete fenced
 blocks and externally frozen regions out of the generic layout path."
   (save-excursion
     (goto-char (point-min))
-    (while (< (point) (point-max))
+    (while (not (eobp))
       (let* ((start (point))
              (end (line-end-position)))
         (unless (or (= start end)
@@ -1967,7 +1967,7 @@ responsibility of the mode that owns the rendered view."
     (when enabled
       (save-excursion
         (goto-char (point-min))
-        (while (< (point) (point-max))
+        (while (not (eobp))
           (let* ((start (point))
                  (end (line-end-position))
                  (prefix (md-render--wrap-prefix-for-line start end)))
@@ -2072,11 +2072,11 @@ skipped."
             ;; row boundaries.
             (save-excursion
               (goto-char rendered-end)
-              (when (and (< (point) (point-max))
+              (when (and (not (eobp))
                          (not (eq (char-after) ?\n)))
                 (end-of-line)
                 (setq trailing-end (point)))
-              (when (and (< (point) (point-max))
+              (when (and (not (eobp))
                          (eq (char-after) ?\n))
                 (forward-char 1)
                 (while (and (not (eobp))

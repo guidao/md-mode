@@ -43,10 +43,6 @@
 (require 'subr-x)
 (require 'text-property-search)
 
-(declare-function hel-keymap-local-set "hel-core" (&rest args))
-(declare-function md-render-apply-continuation-layout
-  "md-render" (&key enabled))
-
 (defgroup md nil
   "Edit and render Markdown buffers."
   :group 'text)
@@ -343,7 +339,7 @@ independent editing mode."
                (save-excursion
                  (goto-char (point-min))
                  (catch 'han
-                   (while (< (point) (point-max))
+                   (while (not (eobp))
                      (when (eq (aref char-script-table (char-after)) 'han)
                        (throw 'han (point)))
                      (forward-char 1)))))
@@ -399,7 +395,7 @@ independent editing mode."
   "Return fold bounds when point is on the front matter opener."
   (save-excursion
     (beginning-of-line)
-    (when (and (= (point) (point-min))
+    (when (and (bobp)
                (looking-at "^---[ \t]*$"))
       (forward-line 1)
       (let ((begin (point)))
@@ -1539,7 +1535,7 @@ When the region is active, use its lines as the callout body."
                          (not (md-mode--inside-fenced-block-p separator)))
                 (goto-char separator)
                 (forward-line 1)
-                (while (and (< (point) (point-max))
+                (while (and (not (eobp))
                             (md-mode--table-row-cells))
                   (forward-line 1))
                 (when (and (>= origin begin) (< origin (point)))
@@ -2296,7 +2292,7 @@ Applies to both the edit and the rendered view."
     (widen)
     (save-excursion
       (goto-char (point-min))
-      (while (< (point) (point-max))
+      (while (not (eobp))
         (let ((bounds (md-mode--table-bounds)))
           (if (and bounds (= (point) (car bounds)))
               (goto-char (md-mode--align-table-at-point bounds))
