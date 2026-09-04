@@ -143,6 +143,17 @@
                    ("code" (md-render-inline-code))
                    (" b" nil)))))
 
+(ert-deftest md-render-convert-variable-backtick-inline-code ()
+  (let ((rendered (md-render-convert "a ``one ` tick`` b")))
+    (should (equal (substring-no-properties rendered)
+                   "a one ` tick b"))
+    (should (eq (get-text-property 2 'face rendered)
+                'md-render-inline-code))))
+
+(ert-deftest md-render-variable-backtick-inline-code-reconstructs ()
+  (should (equal (md-render-tests--roundtrip "``one ` tick``")
+                 "``one ` tick``")))
+
 (ert-deftest md-render-convert-strikethrough ()
   (should (equal (md-render--deconstruct
                   (md-render-convert "a ~~b~~ c"))
@@ -175,6 +186,36 @@
                  '(("Big" (md-render-header-2 md-render-bold))
                    (" title" (md-render-header-2))
                    ("\n" nil)))))
+
+(ert-deftest md-render-convert-setext-headings ()
+  (should (equal (md-render--deconstruct
+                  (md-render-convert "First\n=====\nSecond\n---\n"))
+                 '(("First" (md-render-header-1))
+                   ("\n" nil)
+                   ("Second" (md-render-header-2))
+                   ("\n" nil)))))
+
+(ert-deftest md-render-setext-heading-has-context-and-reconstructs ()
+  (with-temp-buffer
+    (insert "Title\n---\n")
+    (md-render-replace-markup :force t :render-images nil)
+    (should (equal (get-text-property (point-min)
+                                      'md-render-line-context)
+                   '(:kind heading :level 2 :face md-render-header-2)))
+    (should (equal (md-render-reconstruct (point-min) (point-max))
+                   "Title\n---\n"))))
+
+(ert-deftest md-render-incomplete-setext-heading-remains-literal ()
+  (should (equal (substring-no-properties
+                  (md-render-convert "Title\n---"))
+                 "Title\n---")))
+
+(ert-deftest md-render-atx-heading-followed-by-divider-does-not-become-setext ()
+  (let ((rendered (md-render-convert "# Title\n---\n")))
+    (should (equal (substring-no-properties rendered) "Title\n---\n"))
+    (should (eq (get-text-property 0 'face rendered)
+                'md-render-header-1))
+    (should (get-text-property 6 'display rendered))))
 
 (ert-deftest md-render-convert-fenced-block-protects-markup ()
   (should (equal (md-render--deconstruct
@@ -618,11 +659,9 @@ raise SystemExit
 (ert-deftest md-render-convert-divider-dashes ()
   ;; A `---' line gets a `display' property and `md-render-frozen'
   ;; tag.  The chars themselves stay in the buffer beneath the display.
-  (let ((s (md-render-convert "above
----
-below")))
-    (should (eq t (get-text-property 6 'md-render-frozen s)))
-    (should (get-text-property 6 'display s))))
+  (let ((s (md-render-convert "---\n")))
+    (should (eq t (get-text-property 0 'md-render-frozen s)))
+    (should (get-text-property 0 'display s))))
 
 (ert-deftest md-render-convert-divider-stars ()
   (let ((s (md-render-convert "above
@@ -735,6 +774,57 @@ after" nil)))))
                  "│ A │ B │
 ├───┼───┤
 │ 1 │ 2 │")))
+
+(ert-deftest md-render-convert-table-gfm-alignments ()
+  ;; Separator alignment applies equally to headers and data.  Center
+  ;; gets five padding columns here: two left and three right.
+  (should
+   (equal
+    (substring-no-properties
+     (md-render-convert
+      "| Default | Left | Right | Center |\n|---|:---|---:|:---:|\n| d | l | r | c |"))
+    "│ Default │ Left │ Right │ Center │\n├─────────┼──────┼───────┼────────┤\n│ d       │ l    │     r │   c    │")))
+
+(ert-deftest md-render-table-alignment-parses-gfm-separators ()
+  (should (eq 'left (md-render--table-alignment "---")))
+  (should (eq 'left (md-render--table-alignment ":---")))
+  (should (eq 'right (md-render--table-alignment "---:")))
+  (should (eq 'center (md-render--table-alignment ":---:"))))
+
+(ert-deftest md-render-table-navigation-lands-on-aligned-content ()
+  (with-temp-buffer
+    (insert "| A | B |\n|---:|:---:|\n| 1 | 2 |")
+    (md-render-replace-markup)
+    (goto-char (point-min))
+    (search-forward "A")
+    (backward-char)
+    (md-render-table-next-cell)
+    (should (eq (char-after) ?B))
+    (md-render-table-next-cell)
+    (should (eq (char-after) ?1))))
+
+(ert-deftest md-render-pad-table-string-aligns-odd-padding ()
+  (should (equal "x    "
+                 (md-render--pad-table-string
+                  :str "x" :width 5 :alignment 'left)))
+  (should (equal "    x"
+                 (md-render--pad-table-string
+                  :str "x" :width 5 :alignment 'right)))
+  (should (equal " x  "
+                 (md-render--pad-table-string
+                  :str "x" :width 4 :alignment 'center))))
+
+(ert-deftest md-render-convert-table-gfm-alignment-wraps ()
+  (let ((md-render-table-wrap-columns t)
+        (md-render-table-max-width-fraction 1.0))
+    (cl-letf (((symbol-function 'md-render--display-width)
+               (lambda () 18)))
+      (should
+       (equal
+        (substring-no-properties
+         (md-render-convert
+          "| A | B |\n|:---:|---:|\n| long words here | right side |"))
+        "│   A   │     B │\n├───────┼───────┤\n│ long  │ right │\n│ words │  side │\n│ here  │       │")))))
 
 (ert-deftest md-render-convert-table-output-with-bold ()
   ;; Bold markup inside cells is stripped by the main pipeline before
@@ -1563,6 +1653,20 @@ A " nil)
     (should (eq (get-text-property (- (point-max) 1) 'face)
                 'md-render-inline-code))))
 
+(ert-deftest md-render-variable-backtick-code-completes-across-chunks ()
+  (with-temp-buffer
+    (insert "text ``one `")
+    (md-render-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "text ``one `"))
+    (goto-char (point-max))
+    (insert " tick``")
+    (md-render-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "text one ` tick"))
+    (should (eq (get-text-property (- (point-max) 1) 'face)
+                'md-render-inline-code))))
+
 (ert-deftest md-render-replace-markup-force-clears-watermark ()
   ;; The `:force' key drops the stored watermark before the call, so
   ;; the whole buffer is re-scanned.  We simulate a maximally
@@ -2199,6 +2303,192 @@ for a fully-selected buffer."
                    (regexp-quote "\\(literal\\)")
                    (buffer-substring-no-properties
                     (point-min) (point-max)))))))))
+
+(ert-deftest md-render-cached-single-dollar-math-displays-and-reconstructs ()
+  (with-temp-buffer
+    (let ((md-render-math-enabled t)
+          (md-render-mermaid-enabled nil)
+          (md-render-render-functions '(md-render--render-media)))
+      (cl-letf (((symbol-function 'executable-find)
+                 (lambda (command)
+                   (and (member command '("latex" "dvisvgm" "emacs"))
+                        (concat "/fake/" command))))
+                ((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'file-exists-p) (lambda (_file) t))
+                ((symbol-function 'create-image)
+                 (lambda (&rest _) '(image :type svg :fake t))))
+        (insert "before $a_b + 1$ after")
+        (let ((source (buffer-string)))
+          (md-render-replace-markup :force t :render-images nil)
+          (should (equal (md-render-reconstruct (point-min) (point-max))
+                         source))
+          (let ((position (text-property-not-all
+                           (point-min) (point-max)
+                           'md-render-media-file nil)))
+            (should position)
+            (should (equal (get-text-property position 'display)
+                         '(image :type svg :fake t)))
+            (should-not (get-text-property position
+                                           'md-render-block-centered))))))))
+
+(ert-deftest md-render-single-dollar-math-avoids-literal-dollar-contexts ()
+  (with-temp-buffer
+    (let ((md-render-math-enabled t)
+          (md-render-render-functions '(md-render--render-media)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'executable-find)
+                 (lambda (command)
+                   (and (member command '("latex" "dvisvgm" "emacs"))
+                        (concat "/fake/" command))))
+                ((symbol-function 'file-exists-p) (lambda (_file) t))
+                ((symbol-function 'create-image)
+                 (lambda (&rest _) '(image :type svg :fake t))))
+        (insert "escaped \\$x$; prices $20 and $30; `code $x$`; $$x$$\n"
+                "```text\nfenced $x$\n```\n")
+        (let ((source (buffer-string)))
+          (md-render-replace-markup :force t :render-images nil)
+          (should (equal (md-render-reconstruct (point-min) (point-max))
+                         source))
+          (let ((media-sources
+                 (cl-loop for position from (point-min) below (point-max)
+                          when (get-text-property
+                                position 'md-render-media-file)
+                          collect (get-text-property
+                                   position 'md-render-source))))
+            (should (equal media-sources '("$$x$$")))))))))
+
+(ert-deftest md-render-disabled-single-dollar-math-stays-literal ()
+  (with-temp-buffer
+    (let ((md-render-math-enabled nil)
+          (md-render-render-functions '(md-render--render-media)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t)))
+        (insert "$a*b*$")
+        (md-render-replace-markup :force t :render-images nil)
+        (should (equal (buffer-string) "$a*b*$"))
+        (should (get-text-property (point-min) 'md-render-frozen))))))
+
+(ert-deftest md-render-single-dollar-math-streams-from-open-delimiter ()
+  (with-temp-buffer
+    (let ((md-render-math-enabled t)
+          (md-render-render-functions '(md-render--render-media)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'executable-find) (lambda (_command) nil)))
+        (insert "prefix\n$x + 1")
+        (let ((start (save-excursion
+                       (goto-char (point-min))
+                       (search-forward "$x")
+                       (- (point) 2))))
+          (md-render-replace-markup :force t :render-images nil)
+          (should (= (get-text-property (point-min) 'md-render-watermark)
+                     start))
+          (goto-char (point-max))
+          (insert "$ suffix")
+          (md-render-replace-markup :render-images nil)
+          (should (equal (buffer-string) "prefix\n$x + 1$ suffix"))
+          (should (get-text-property start 'md-render-frozen)))))))
+
+(ert-deftest md-render-incomplete-currency-does-not-hold-watermark ()
+  (with-temp-buffer
+    (let ((md-render-math-enabled t)
+          (md-render-render-functions '(md-render--render-media)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'executable-find) (lambda (_command) nil)))
+        (insert "The price is $20")
+        (md-render-replace-markup :force t :render-images nil)
+        (should (= (get-text-property (point-min) 'md-render-watermark)
+                   (line-beginning-position)))))))
+
+(ert-deftest md-render-block-math-centering-is-math-only-and-reconstructs ()
+  (dolist (source '("\\[x = y\\]" "$$x = y$$"
+                    "```math\nx = y\n```\n"))
+    (with-temp-buffer
+      (let ((fake-image (list 'image :type 'svg :fake (make-symbol "image")))
+            (md-render-math-enabled t)
+            (md-render-render-functions '(md-render--render-media)))
+        (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                  ((symbol-function 'executable-find)
+                   (lambda (command)
+                     (and (member command '("latex" "dvisvgm" "emacs"))
+                          (concat "/fake/" command))))
+                  ((symbol-function 'file-exists-p) (lambda (_file) t))
+                  ((symbol-function 'create-image)
+                   (lambda (&rest _) fake-image)))
+          (insert source)
+          (md-render-replace-markup :force t :render-images nil)
+          (let ((alignment-position (1+ (point-min)))
+                (image-position (+ 2 (point-min))))
+            (should (equal (buffer-substring-no-properties
+                            (point-min) (+ 5 (point-min)))
+                           "\n  \n\n"))
+            (let* ((spacer-display
+                    (get-text-property alignment-position 'display))
+                   (half-width (nth 2 (plist-get (cdr spacer-display)
+                                                 :align-to))))
+              (should (equal spacer-display
+                             `(space :align-to
+                                     (- center (0.5 . ,fake-image)))))
+              (should (eq (cdr half-width) fake-image))
+              (should-not (eq (cdr half-width) 'image)))
+            (should (get-text-property alignment-position
+                                       'md-render-block-centered))
+            (should-not (get-text-property alignment-position
+                                           'md-render-media-file))
+            (should (get-text-property image-position
+                                       'md-render-media-file))
+            (should (eq (get-text-property image-position 'display)
+                        fake-image)))
+          (should (equal (md-render-reconstruct (point-min) (point-max))
+                         source)))))))
+
+(ert-deftest md-render-async-block-math-keeps-centering-presentation ()
+  (with-temp-buffer
+    (let ((fake-image (list 'image :type 'svg :fake (make-symbol "image")))
+          watcher)
+      (cl-letf (((symbol-function 'md-render--watch-media)
+                 (lambda (backend source file marker label)
+                   (setq watcher (list (current-buffer) marker label backend))
+                   (should (equal source "$$x$$"))
+                   (should (stringp file))))
+                ((symbol-function 'create-image)
+                 (lambda (&rest _) fake-image)))
+        (insert "$$x$$")
+        (md-render--insert-media
+         :start (point-min) :end (point-max)
+         :source "$$x$$" :render-source "$$x$$"
+         :backend 'math :block-p t :label "Math")
+        (pcase-let ((`(,_buffer ,marker ,_label ,_backend) watcher))
+          (let ((alignment-position (1- marker)))
+            (should (get-text-property alignment-position
+                                       'md-render-block-centered))
+            (should-not (get-text-property alignment-position 'display))
+            (should-not (get-text-property alignment-position
+                                           'md-render-media-file)))
+          (should (get-text-property marker 'md-render-media-file))
+          (md-render--media-apply
+           watcher (get-text-property marker 'md-render-media-file) nil)
+          (should (eq (get-text-property marker 'display) fake-image))
+          (let* ((spacer-display (get-text-property (1- marker) 'display))
+                 (half-width (nth 2 (plist-get (cdr spacer-display)
+                                               :align-to))))
+            (should (equal spacer-display
+                           `(space :align-to
+                                   (- center (0.5 . ,fake-image)))))
+            (should (eq (cdr half-width) fake-image))
+            (should-not (eq (cdr half-width) 'image)))
+          (should-not (get-text-property marker 'line-prefix)))))))
+
+(ert-deftest md-render-block-math-centering-does-not-change-diagrams ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'md-render--watch-media) #'ignore))
+      (insert "diagram")
+      (md-render--insert-media
+       :start (point-min) :end (point-max)
+       :source "diagram" :render-source "diagram"
+       :backend 'graphviz :block-p t :label "Graphviz")
+      (should (equal (buffer-string) "\n \n\n"))
+      (should-not (text-property-not-all
+                   (point-min) (point-max)
+                   'md-render-block-centered nil)))))
 
 (ert-deftest md-render-cached-mermaid-displays-png-and-reconstructs ()
   (with-temp-buffer

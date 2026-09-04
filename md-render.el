@@ -476,6 +476,7 @@ body un-fontified."
           (source-blocks)
           (source-ranges)
           (rendered-ranges)
+          (code-spans)
           (inline-ranges)
           (avoid-ranges))
       (save-restriction
@@ -488,6 +489,7 @@ body un-fontified."
         ;; renders a static region through, so the two cannot drift.
         (setq context (md-render-context))
         (setq source-blocks (map-elt context :source-blocks))
+        (setq code-spans (map-elt context :code-spans))
         ;; Inline `code' spans, computed before the renderers run so an
         ;; external renderer can skip verbatim spans the same way it skips
         ;; fenced blocks.  The markers survive any buffer edits a renderer
@@ -519,7 +521,9 @@ body un-fontified."
                                       :avoid-ranges avoid-ranges)))
                  (or italic-changed bold-changed strike-changed)))
         (md-render--replace-headers :avoid-ranges avoid-ranges)
-        (md-render--style-inline-code :avoid-ranges source-ranges)
+        (md-render--style-inline-code
+         :code-spans code-spans
+         :avoid-ranges source-ranges)
         (md-render--replace-links :avoid-ranges avoid-ranges)
         (when render-images
           (md-render--replace-images
@@ -600,13 +604,14 @@ Builds the same CONTEXT alist that
 the buffer is narrowed to right now:
 
   ((:source-blocks . SOURCE-BLOCKS)
+   (:code-spans . CODE-SPANS)
    (:inline-code-ranges . INLINE-CODE-RANGES))
 
 SOURCE-BLOCKS are the fenced-block descriptors from
-`md-render--source-blocks'.  INLINE-CODE-RANGES are
-marker ranges covering inline `code' span bodies, computed with the
-fenced blocks as avoid-ranges so backticks inside a fenced block are
-not mistaken for an inline span.  See
+`md-render--source-blocks'.  CODE-SPANS are descriptors from
+`md-render--code-spans'.  INLINE-CODE-RANGES are their body marker
+ranges, computed with the fenced blocks as avoid-ranges so backticks
+inside a fenced block are not mistaken for an inline span.  See
 `md-render-render-functions' for the meaning of each key.
 
 `md-render-replace-markup' builds its context through
@@ -616,10 +621,16 @@ obtain the identical context and stay in sync with the streaming
 path."
   (let* ((source-blocks (md-render--source-blocks))
          (source-ranges (md-render--source-block-ranges source-blocks))
-         (inline-ranges (md-render--make-markers
-                         (md-render--inline-code-ranges
-                          :avoid-ranges source-ranges))))
+         (code-spans (md-render--code-spans
+                      :avoid-ranges source-ranges))
+         (inline-ranges (mapcar
+                         (lambda (span)
+                           (let ((body (map-elt span :body)))
+                             (cons (map-elt body :start)
+                                   (map-elt body :end))))
+                         code-spans)))
     (list (cons :source-blocks source-blocks)
+          (cons :code-spans code-spans)
           (cons :inline-code-ranges inline-ranges))))
 
 (defun md-render--run-render-functions (context)
@@ -700,21 +711,44 @@ this returns `(((:watermark . 1200)))'."
     (when (and (buffer-live-p buffer)
                (marker-buffer marker))
       (with-current-buffer buffer
-        (let ((position (marker-position marker)))
+        (let* ((position (marker-position marker))
+               (alignment-position
+                (and (eq backend 'math)
+                     (> position (point-min))
+                     (get-text-property (1- position)
+                                        'md-render-block-centered)
+                     (1- position))))
           (when (equal (get-text-property position 'md-render-media-file)
                        file)
             (let ((inhibit-read-only t))
               (with-silent-modifications
                 (condition-case err
-                    (put-text-property
-                     position (1+ position) 'display
-                     (if error-message
-                         (propertize
-                          (format "⚠ %s" label)
-                          'face 'error
-                          'help-echo error-message)
-                       (md-render--media-image file backend)))
+                    (if error-message
+                        (progn
+                          (put-text-property
+                           position (1+ position) 'display
+                           (propertize
+                            (format "⚠ %s" label)
+                            'face 'error
+                            'help-echo error-message))
+                          (when alignment-position
+                            (remove-text-properties
+                             alignment-position (1+ alignment-position)
+                             '(display nil))))
+                      (let ((image (md-render--media-image file backend)))
+                        (put-text-property
+                         position (1+ position) 'display image)
+                        (when alignment-position
+                          (put-text-property
+                           alignment-position (1+ alignment-position)
+                           'display
+                           `(space :align-to
+                                   (- center (0.5 . ,image)))))))
                   (error
+                   (when alignment-position
+                     (remove-text-properties
+                      alignment-position (1+ alignment-position)
+                      '(display nil)))
                    (put-text-property
                     position (1+ position) 'display
                     (propertize
@@ -882,12 +916,23 @@ the placeholder occupies its own paragraph.  LABEL identifies
 rendering errors."
   (let* ((file (md-render--media-cache-file backend render-source))
          (carried (md-render--carry-properties start))
-         (placeholder (if block-p "\n \n\n" " "))
+         (centered-math-p (and block-p (eq backend 'math)))
+         (placeholder (cond
+                       (centered-math-p "\n  \n\n")
+                       (block-p "\n \n\n")
+                       (t " ")))
+         alignment-position
          image-position)
     (delete-region start end)
     (goto-char start)
     (insert placeholder)
-    (setq image-position (if block-p (1+ start) start))
+    (when centered-math-p
+      (setq alignment-position (1+ start)))
+    (setq image-position
+          (cond
+           (centered-math-p (+ 2 start))
+           (block-p (1+ start))
+           (t start)))
     (add-text-properties
      start (point)
      (append
@@ -899,6 +944,9 @@ rendering errors."
                               md-render-media-file))))
     (put-text-property image-position (1+ image-position)
                        'md-render-media-file file)
+    (when alignment-position
+      (put-text-property alignment-position (1+ alignment-position)
+                         'md-render-block-centered t))
     (md-render--watch-media
      backend render-source file (copy-marker image-position) label)))
 
@@ -978,6 +1026,86 @@ rendering errors."
              ('plantuml "PlantUML")
              ('graphviz "Graphviz"))))))))
 
+(defun md-render--escaped-p (position)
+  "Return non-nil when the character at POSITION is backslash-escaped."
+  (let ((backslashes 0))
+    (save-excursion
+      (goto-char position)
+      (while (eq (char-before) ?\\)
+        (setq backslashes (1+ backslashes))
+        (backward-char)))
+    (cl-oddp backslashes)))
+
+(defun md-render--single-dollar-close-p (position)
+  "Return non-nil when POSITION is a safe single-dollar closer."
+  (and (eq (char-after position) ?$)
+       (not (eq (char-before position) ?$))
+       (not (eq (char-after (1+ position)) ?$))
+       (not (md-render--escaped-p position))
+       (let ((before (char-before position))
+             (after (char-after (1+ position))))
+         (and before
+              (not (memq before '(?\s ?\t ?\n ?\r)))
+              (not (and after (>= after ?0) (<= after ?9)))))))
+
+(defun md-render--single-dollar-matches (avoid-ranges)
+  "Return safe single-dollar math matches outside AVOID-RANGES.
+
+The result is a cons whose car is a list of (START . END) ranges
+and whose cdr is the earliest incomplete non-currency opener."
+  (let (matches watermark)
+    (save-excursion
+      (goto-char (point-min))
+      (while (search-forward "$" nil t)
+        (let* ((start (1- (point)))
+               (avoid (md-render-in-avoid-range-p
+                       start (1+ start) avoid-ranges))
+               (next (char-after (point))))
+          (cond
+           (avoid
+            (goto-char (cdr avoid)))
+           ((md-render--escaped-p start)
+            ;; Treat the next plausible closer as part of the escaped
+            ;; literal, so it cannot become a spurious opener itself.
+            (while (and (search-forward "$" (line-end-position) t)
+                        (not (md-render--single-dollar-close-p
+                              (1- (point)))))))
+           ((or (eq (char-before start) ?$)
+                (eq next ?$)
+                (null next)
+                (memq next '(?\s ?\t ?\n ?\r))))
+           (t
+            (let (end)
+              (save-excursion
+                (while (and (not end)
+                            (search-forward "$" (line-end-position) t))
+                  (let ((candidate (1- (point))))
+                    (when (and
+                           (md-render--single-dollar-close-p candidate)
+                           (not
+                            (seq-some
+                             (lambda (range)
+                               (and (< (car range) (1+ candidate))
+                                    (> (cdr range) start)))
+                             avoid-ranges)))
+                      (setq end (point))))))
+              (if (and end
+                       (or (not (and (>= next ?0) (<= next ?9)))
+                           (not (string-match-p
+                                 "[[:space:]]"
+                                 (buffer-substring-no-properties
+                                  (1+ start) (1- end))))))
+                  (progn
+                    (push (cons start end) matches)
+                    (goto-char end))
+                ;; A leading digit is normally currency.  Do not pin the
+                ;; streaming frontier for an ordinary incomplete price.
+                (unless (and (>= next ?0) (<= next ?9))
+                  (setq watermark
+                        (if watermark (min watermark start) start)))
+                (goto-char (line-end-position)))))))))
+    (cons (nreverse matches) watermark)))
+
 (defun md-render--render-inline-math (context available)
   "Render inline and block math from CONTEXT when AVAILABLE.
 
@@ -988,6 +1116,23 @@ Return the earliest incomplete math delimiter, or nil."
            (map-elt context :source-blocks))
           (map-elt context :inline-code-ranges)))
         watermark)
+    (pcase-let ((`(,matches . ,pending)
+                 (md-render--single-dollar-matches avoid-ranges)))
+      (setq watermark (and pending (copy-marker pending)))
+      (dolist (range (reverse matches))
+        (pcase-let ((`(,start . ,end) range))
+          (unless (get-text-property start 'md-render-frozen)
+            (if available
+                (let ((source (buffer-substring-no-properties start end)))
+                  (md-render--insert-media
+                   :start start
+                   :end end
+                   :source source
+                   :render-source source
+                   :backend 'math
+                   :block-p nil
+                   :label "Math"))
+              (put-text-property start end 'md-render-frozen t))))))
     (dolist (spec '(("\\(" "\\)") ("\\[" "\\]") ("$$" "$$")))
       (save-excursion
         (goto-char (point-min))
@@ -1016,10 +1161,12 @@ Return the earliest incomplete math delimiter, or nil."
                     (put-text-property start end
                                        'md-render-frozen t)))))
              (t
-              (setq watermark
-                    (if watermark (min watermark start) start))
+              (let ((current (and watermark
+                                  (marker-position watermark))))
+                (setq watermark
+                      (copy-marker (if current (min current start) start))))
               (goto-char (point-max))))))))
-    watermark))
+    (and watermark (marker-position watermark))))
 
 (defun md-render--render-media (context)
   "Render supported Math and Mermaid regions described by CONTEXT."
@@ -1043,9 +1190,10 @@ Return the earliest incomplete math delimiter, or nil."
               (and md-render-graphviz-enabled
                    (md-render--graphviz-tool-available-p)
                    'graphviz))))
-      (when md-render-math-enabled
-        (setq watermark
-              (md-render--render-inline-math context math-available)))
+      ;; Scan even when previews are disabled so later Markdown passes do
+      ;; not reinterpret literal math source as emphasis or links.
+      (setq watermark
+            (md-render--render-inline-math context math-available))
       (md-render--render-fenced-media context available-backends)
       (and watermark (list (cons :watermark watermark))))))
 
@@ -1181,7 +1329,7 @@ For example, the buffer \"a ~~b~~ c\" becomes \"a b c\" with face
     changed))
 
 (cl-defun md-render--replace-headers (&key avoid-ranges)
-  "Replace `# X' / `## X' / ... headers with X faced as `org-level-N'.
+  "Render ATX and Setext headings with `md-render-header-N' faces.
 
 The `#' prefix and one or more separator spaces are stripped; the
 title text is left with face `md-render-header-N' where N is
@@ -1194,9 +1342,61 @@ chunk that lands `# He' followed later by `llo World\\n' renders
 the full `Hello World' on the second call rather than eagerly
 facing `He' and leaving `llo World' plain.
 
+Setext underlines made of `=' or `-' render the preceding text as
+level 1 or level 2.  The underline is removed, and the title stores
+both source lines for reconstruction.  Setext headings, like ATX
+headings, require a trailing newline.
+
 For example, the buffer \"## My title\\n\" becomes \"My title\\n\"
 with face `md-render-header-2' on \"My title\"."
   (let ((case-fold-search nil))
+    (goto-char (point-min))
+    (while (re-search-forward
+            (rx bol
+                (group (zero-or-more blank)
+                       (one-or-more not-newline))
+                "\n"
+                (zero-or-more blank)
+                (group (or (one-or-more "=")
+                           (one-or-more "-")))
+                (zero-or-more blank) "\n")
+            nil t)
+      (let* ((markup-start (match-beginning 0))
+             (markup-end (match-end 0))
+             (title-start (match-beginning 1))
+             (title-end (match-end 1))
+             (title-source (match-string-no-properties 1))
+             (underline (match-string-no-properties 2))
+             (atx-title-p
+              (string-match-p
+               (rx string-start (zero-or-more blank)
+                   (one-or-more "#")
+                   (or string-end (one-or-more blank)))
+               title-source))
+             (avoid (md-render-in-avoid-range-p
+                     markup-start markup-end avoid-ranges)))
+        (if (or avoid atx-title-p)
+            (goto-char (if avoid (cdr avoid) markup-end))
+          (let* ((level (if (eq (aref underline 0) ?=) 1 2))
+                 (face (intern (format "md-render-header-%d" level)))
+                 (text (buffer-substring title-start title-end))
+                 (source (md-render-reconstruct markup-start
+                                                (1- markup-end)))
+                 (newline-properties
+                  (md-render--carry-properties (1- markup-end))))
+            (delete-region markup-start markup-end)
+            (goto-char markup-start)
+            (insert text)
+            (let ((end (point)))
+              (insert "\n")
+              (when newline-properties
+                (add-text-properties end (point) newline-properties))
+              (add-face-text-property markup-start end face)
+              (put-text-property
+               markup-start end 'md-render-line-context
+               (list :kind 'heading :level level :face face))
+              (put-text-property markup-start end
+                                 'md-render-source source))))))
     (goto-char (point-min))
     (while (re-search-forward
             (rx bol (zero-or-more blank) (group (one-or-more "#"))
@@ -1239,8 +1439,8 @@ with face `md-render-header-2' on \"My title\"."
                 (put-text-property markup-start end
                                    'md-render-source source)))))))))
 
-(cl-defun md-render--style-inline-code (&key avoid-ranges)
-  "Strip backticks from complete inline `X` spans and face the body.
+(cl-defun md-render--style-inline-code (&key code-spans avoid-ranges)
+  "Strip delimiters from complete CODE-SPANS and face their bodies.
 
 The body of each well-formed `` `X` `` is left in place with
 face `md-render-inline-code' and tagged with the text
@@ -1252,16 +1452,18 @@ code blocks) are left untouched.
 
 For example, the buffer \"a `code` b\" becomes \"a code b\" with
 face `md-render-inline-code' on \"code\"."
-  (let ((case-fold-search nil))
-    (goto-char (point-min))
-    (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
-      (let* ((markup-start (match-beginning 0))
-             (markup-end (match-end 0))
+  (dolist (span (reverse code-spans))
+    (when (map-elt span :complete)
+      (let* ((markup (map-elt span :markup))
+             (body (map-elt span :body))
+             (markup-start (map-elt markup :start))
+             (markup-end (map-elt markup :end))
+             (body-start (map-elt body :start))
+             (body-end (map-elt body :end))
              (avoid (md-render-in-avoid-range-p
                      markup-start markup-end avoid-ranges)))
-        (if avoid
-            (goto-char (cdr avoid))
-          (let ((text (buffer-substring (match-beginning 1) (match-end 1)))
+        (unless (or avoid (= body-start body-end))
+          (let ((text (buffer-substring body-start body-end))
                 (source (unless (get-text-property markup-start
                                                    'md-render-source)
                           (md-render-reconstruct
@@ -2579,7 +2781,44 @@ width exceeds the column budget, drifting the right pipe."
               (setq pos (1+ pos))))))
       (nreverse lines)))))
 
-(cl-defun md-render--pad-table-string (&key str width window force-pixel)
+(defun md-render--table-alignment (separator)
+  "Return the GFM alignment declared by SEPARATOR.
+
+SEPARATOR is a trimmed separator-cell string.  A leading colon
+declares left alignment, a trailing colon declares right alignment,
+and both declare centered alignment.  A cell without colons uses the
+existing default left alignment."
+  (let ((left (string-prefix-p ":" separator))
+        (right (string-suffix-p ":" separator)))
+    (cond
+     ((and left right) 'center)
+     (right 'right)
+     (t 'left))))
+
+(defun md-render--table-padding-widths (padding alignment)
+  "Split PADDING columns into left and right widths for ALIGNMENT.
+
+Centered padding assigns an odd extra column to the right, making the
+allocation deterministic."
+  (pcase alignment
+    ('right (cons padding 0))
+    ('center (let ((left (/ padding 2)))
+               (cons left (- padding left))))
+    (_ (cons 0 padding))))
+
+(defun md-render--table-pixel-padding (pixels char-pixels)
+  "Return a display string occupying PIXELS using CHAR-PIXELS spaces."
+  (if (<= pixels 0)
+      ""
+    (let* ((full-spaces (floor (/ (float pixels) char-pixels)))
+           (remaining (- pixels (* full-spaces char-pixels))))
+      (concat (make-string full-spaces ?\s)
+              (if (> remaining 0)
+                  (propertize " " 'display `(space :width (,remaining)))
+                "")))))
+
+(cl-defun md-render--pad-table-string
+    (&key str width window force-pixel (alignment 'left))
   "Pad STR with spaces to reach WIDTH columns.
 
 ASCII-only strings take the cheap `string-width' + spaces path.
@@ -2595,7 +2834,9 @@ multi-line cell on the same path — otherwise a wrapped cell that
 splits non-ASCII content (e.g. an em dash) onto one line and pure
 ASCII content onto another would render those continuation lines
 via different paths and drift sub-pixel on their right edge.
-WINDOW supplies the active display metrics."
+WINDOW supplies the active display metrics.  ALIGNMENT controls where
+the padding is placed; it is `left', `right', or `center'.  Centered
+padding puts an odd extra column on the right."
   (if (and window
            (window-live-p window)
            (fboundp 'window-text-pixel-size)
@@ -2607,26 +2848,31 @@ WINDOW supplies the active display metrics."
           (let* ((char-px (md-render--table-char-pixel-width window))
                  (target-px (* width char-px))
                  (content-px (md-render--table-measure-string str window))
-                 (pad-px (- target-px content-px)))
+                 (pad-px (- target-px content-px))
+                 (widths (md-render--table-padding-widths
+                          pad-px alignment)))
             (if (<= pad-px 0)
                 str
-              (let* ((full-spaces (floor (/ (float pad-px) char-px)))
-                     (remaining-px (- pad-px (* full-spaces char-px))))
-                (concat str
-                        (make-string full-spaces ?\s)
-                        (if (> remaining-px 0)
-                            (propertize " " 'display
-                                        `(space :width (,remaining-px)))
-                          "")))))
-        (error (md-render--pad-table-string-ascii :str str :width width)))
-    (md-render--pad-table-string-ascii :str str :width width)))
+              (concat
+               (md-render--table-pixel-padding (car widths) char-px)
+               str
+               (md-render--table-pixel-padding (cdr widths) char-px))))
+        (error (md-render--pad-table-string-ascii
+                :str str :width width :alignment alignment)))
+    (md-render--pad-table-string-ascii
+     :str str :width width :alignment alignment)))
 
-(cl-defun md-render--pad-table-string-ascii (&key str width)
-  "Append spaces to STR until it reaches WIDTH columns."
-  (let ((current (string-width str)))
+(cl-defun md-render--pad-table-string-ascii
+    (&key str width (alignment 'left))
+  "Pad STR to WIDTH columns according to ALIGNMENT."
+  (let* ((current (string-width str))
+         (padding (max 0 (- width current)))
+         (widths (md-render--table-padding-widths padding alignment)))
     (if (>= current width)
         str
-      (concat str (make-string (- width current) ?\s)))))
+      (concat (make-string (car widths) ?\s)
+              str
+              (make-string (cdr widths) ?\s)))))
 
 (defun md-render--make-table-separator-cell (width)
   "Return a separator-cell string of WIDTH dashes."
@@ -2660,12 +2906,14 @@ SEPARATOR-ROW-NUM identifies the row separating headers from data."
       (propertize pipe 'face 'md-render-table-border))
      (propertize right 'face 'md-render-table-border))))
 
-(cl-defun md-render--render-table-data-row (&key processed-cells col-widths row-face window)
+(cl-defun md-render--render-table-data-row
+    (&key processed-cells col-widths alignments row-face window)
   "Build the rendered string for a data row, possibly multi-line.
 
 PROCESSED-CELLS is the list of propertized cell strings.
 COL-WIDTHS is the list of column widths.  ROW-FACE, when non-nil,
 is layered on top of the row content (preserving inline faces).
+ALIGNMENTS supplies one GFM alignment symbol per column.
 WINDOW, when given, is forwarded to `md-render--pad-table-string'
 for pixel-accurate padding of non-ASCII content.
 
@@ -2701,13 +2949,14 @@ logical rows (skipping the visual continuation lines)."
     (dotimes (line-idx max-lines)
       (let ((parts '()))
         (seq-mapn
-         (lambda (cell-lines width force-pixel)
+         (lambda (cell-lines width force-pixel alignment)
            (let* ((line (if (< line-idx (length cell-lines))
                             (nth line-idx cell-lines)
                           ""))
                   (padded (concat " "
                                   (md-render--pad-table-string
                                    :str line :width width :window window
+                                   :alignment alignment
                                    ;; Empty continuation lines have no
                                    ;; content to measure — leaving them
                                    ;; on the ASCII path avoids a wasted
@@ -2726,9 +2975,13 @@ logical rows (skipping the visual continuation lines)."
              ;; leading padding space) so navigation lands cursor on
              ;; the content rather than the border-adjacent space.
              (when (and (zerop line-idx) (> (length padded) 1))
-               (put-text-property 1 2 'md-render-table-cell-start t padded))
+               (let ((content-start
+                      (or (string-match (rx (not space)) padded) 1)))
+                 (put-text-property
+                  content-start (1+ content-start)
+                  'md-render-table-cell-start t padded)))
              (push padded parts)))
-         wrapped col-widths force-pixel-flags)
+         wrapped col-widths force-pixel-flags alignments)
         (push (concat styled-pipe
                       (string-join (nreverse parts) styled-pipe)
                       styled-pipe)
@@ -2737,7 +2990,8 @@ logical rows (skipping the visual continuation lines)."
 
 (cl-defun md-render--preprocess-table (&key rows separator-row-num window)
   "Parse cells in ROWS and compute natural column widths.
-Returns an alist with `:natural-widths' and `:processed-rows'.
+Returns an alist with `:natural-widths', `:processed-rows', and
+`:alignments'.
 
 SEPARATOR-ROW-NUM identifies the row separating headers from data.
 `:min-widths' (wrap-allocation widths from longest words) is no
@@ -2750,11 +3004,19 @@ When WINDOW is given, cell widths are measured with
 pixel-accurate `md-render--table-display-width' so columns
 containing emoji/CJK line up with the column's right border."
   (let ((data-row-num 0)
+        (alignments nil)
         (widths nil)
         (processed-rows nil))
     (dolist (row rows)
       (if (map-elt row :separator)
-          (push (cons row nil) processed-rows)
+          (let ((cells (md-render--parse-table-row
+                        (map-elt row :start) (map-elt row :end))))
+            (setq alignments
+                  (mapcar (lambda (cell)
+                            (md-render--table-alignment
+                             (map-elt cell :content)))
+                          cells))
+            (push (cons row nil) processed-rows))
         (let ((cells (md-render--parse-table-row
                       (map-elt row :start) (map-elt row :end)))
               (col 0)
@@ -2778,7 +3040,12 @@ containing emoji/CJK line up with the column's right border."
           (unless (and separator-row-num
                        (< (map-elt row :num) separator-row-num))
             (setq data-row-num (1+ data-row-num))))))
+    (setq alignments
+          (seq-take (append alignments
+                            (make-list (length widths) 'left))
+                    (length widths)))
     (list (cons :natural-widths widths)
+          (cons :alignments alignments)
           (cons :processed-rows (nreverse processed-rows)))))
 
 (cl-defun md-render--table-min-widths (&key processed-rows window)
@@ -2985,6 +3252,7 @@ prone to a few-pixel drift on emoji-heavy tables."
                           :separator-row-num separator-row-num
                           :window window))
            (natural-widths (map-elt preprocessed :natural-widths))
+           (alignments (map-elt preprocessed :alignments))
            (processed-rows (map-elt preprocessed :processed-rows))
            (target-width (when md-render-table-wrap-columns
                            (floor (* (md-render--display-width)
@@ -3022,8 +3290,9 @@ prone to a few-pixel drift on emoji-heavy tables."
                   (md-render--render-table-data-row
                    :processed-cells processed-cells
                    :col-widths col-widths
-                  :row-face row-face
-                  :window window))
+                   :alignments alignments
+                   :row-face row-face
+                   :window window))
                 rendered-rows)))
       (string-join (nreverse rendered-rows) "\n"))))
 
@@ -3710,36 +3979,66 @@ invoked many times as content grows."
                       limit))))
     (nreverse ranges)))
 
-(cl-defun md-render--inline-code-ranges (&key avoid-ranges)
-  "Return list of (start . end) ranges covering inline `X` bodies.
+(cl-defun md-render--code-spans (&key avoid-ranges)
+  "Return inline code-span descriptors outside AVOID-RANGES.
 
-Each range covers the text between backticks (the backticks
-themselves are not included).  Backticks inside any of
-AVOID-RANGES are ignored.  A line with an odd number of backticks
-has its trailing unmatched backtick treated as still-streaming:
-the range extends from that backtick to end-of-line.
-
-For example, given the buffer \"a `code` b\" returns a list with
-one range covering the body \"code\"."
-  (let ((ranges '())
+A delimiter is a run of backticks and closes only at a later run
+of exactly the same length on the same line.  Each descriptor has
+`:markup' and `:body' marker ranges plus `:complete'.  An unmatched
+opener produces an incomplete descriptor whose body reaches the
+end of its line, keeping streamed content protected."
+  (let ((spans '())
         (case-fold-search nil))
     (save-excursion
       (goto-char (point-min))
       (while (not (eobp))
         (let ((line-end (line-end-position))
-              (open nil))
-          (while (re-search-forward "`" line-end t)
-            (let ((pos (match-beginning 0)))
-              (unless (md-render-in-avoid-range-p pos pos avoid-ranges)
-                (if open
-                    (progn
-                      (push (cons (1+ open) pos) ranges)
-                      (setq open nil))
-                  (setq open pos)))))
-          (when open
-            (push (cons (1+ open) line-end) ranges)))
+              open-start
+              open-end)
+          (while (re-search-forward "`+" line-end t)
+            (let* ((run-start (match-beginning 0))
+                   (run-end (match-end 0))
+                   (avoid (md-render-in-avoid-range-p
+                           run-start run-end avoid-ranges)))
+              (cond
+               (avoid (goto-char (min line-end (cdr avoid))))
+               ((null open-start)
+                (setq open-start run-start
+                      open-end run-end))
+               ((= (- run-end run-start) (- open-end open-start))
+                (push (list
+                       (cons :markup
+                             (md-render--make-range
+                              :start (copy-marker open-start)
+                              :end (copy-marker run-end)))
+                       (cons :body
+                             (md-render--make-range
+                              :start (copy-marker open-end)
+                              :end (copy-marker run-start)))
+                       (cons :complete t))
+                      spans)
+                (setq open-start nil open-end nil)))))
+          (when open-start
+            (push (list
+                   (cons :markup
+                         (md-render--make-range
+                          :start (copy-marker open-start)
+                          :end (copy-marker line-end)))
+                   (cons :body
+                         (md-render--make-range
+                          :start (copy-marker open-end)
+                          :end (copy-marker line-end)))
+                   (cons :complete nil))
+                  spans)))
         (forward-line 1)))
-    (nreverse ranges)))
+    (nreverse spans)))
+
+(cl-defun md-render--inline-code-ranges (&key avoid-ranges)
+  "Return body ranges for code spans outside AVOID-RANGES."
+  (mapcar (lambda (span)
+            (let ((body (map-elt span :body)))
+              (cons (map-elt body :start) (map-elt body :end))))
+          (md-render--code-spans :avoid-ranges avoid-ranges)))
 
 (defun md-render--deconstruct (text)
   "Return TEXT broken into (SUBSTRING FACES) runs.
