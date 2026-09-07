@@ -260,13 +260,16 @@ edge and the view follows the cursor as it moves right
 
 (defvar-local md-render--table-widget-measure-cache nil
   "Pixel measurements reused across table widget layouts.
-A cons (VALIDITY . TABLE): TABLE maps a printed string to its
+A cons (VALIDITY . TABLE): TABLE maps a string with text properties to its
 pixel width, VALIDITY records the font state and measuring
 function it was collected under.  Lives in the buffer whose window
 measures the tables.")
 
 (defconst md-render--table-widget-measure-cache-limit 50000
   "Entries after which `md-render--table-widget-measure-cache' restarts.")
+
+(define-hash-table-test 'md-render--string-properties
+  #'equal-including-properties #'sxhash-equal-including-properties)
 
 (defun md-render--table-widget-measurements (window measure)
   "Return the measurement table for WINDOW valid under MEASURE.
@@ -285,7 +288,8 @@ measuring function changes."
                        (cdr md-render--table-widget-measure-cache))
                       md-render--table-widget-measure-cache-limit))
         (setq md-render--table-widget-measure-cache
-              (cons validity (make-hash-table :test 'equal))))
+              (cons validity (make-hash-table
+                              :test 'md-render--string-properties))))
       (cdr md-render--table-widget-measure-cache))))
 
 (defun md-render--table-widget-layout (widget width)
@@ -301,7 +305,7 @@ measuring function changes."
                               window measure)))
           (cl-letf (((symbol-function 'md-render--table-measure-string)
                      (lambda (string destination)
-                       (let* ((key (prin1-to-string string))
+                       (let* ((key (copy-sequence string))
                               (cached (gethash key measurements 'missing)))
                          (if (eq cached 'missing)
                              (let ((pixels (funcall measure string destination)))

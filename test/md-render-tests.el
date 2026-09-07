@@ -2752,6 +2752,35 @@ for a fully-selected buffer."
           (should (equal-including-properties before (buffer-string)))
           (should (eq modified (buffer-modified-p))))))))
 
+(ert-deftest md-render-table-measure-cache-keeps-properties-and-owns-keys ()
+  (with-temp-buffer
+    (save-window-excursion
+      (switch-to-buffer (current-buffer))
+      (let ((calls 0)
+            (plain (copy-sequence "text"))
+            (styled (propertize "text" 'face 'bold)))
+        (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                  ((symbol-function 'md-render--table-measure-string)
+                   (lambda (string _window)
+                     (cl-incf calls)
+                     (if (get-text-property 0 'face string) 20 10)))
+                  ((symbol-function 'md-render--render-table-widget-source)
+                   (lambda (&rest _)
+                     (should (= 10 (md-render--table-measure-string plain nil)))
+                     (should (= 20 (md-render--table-measure-string styled nil)))
+                     (should (= 20 (md-render--table-measure-string
+                                    (copy-sequence styled) nil)))
+                     (should (= calls 2))
+                     (remove-text-properties 0 4 '(face nil) styled)
+                     (aset styled 0 ?n)
+                     (should (= 20 (md-render--table-measure-string
+                                    (propertize "text" 'face 'bold) nil)))
+                     (should (= 10 (md-render--table-measure-string "text" nil)))
+                     (should (= calls 2)))))
+          (md-render--table-widget-layout '(md-render-table-widget :value "") 80)
+          (should (= 2 (hash-table-count
+                        (cdr md-render--table-widget-measure-cache)))))))))
+
 (provide 'md-render-tests)
 
 ;;; md-render-tests.el ends here
