@@ -2718,6 +2718,40 @@ for a fully-selected buffer."
         (search-backward "\\(a_b\\)")
         (should (get-text-property (point) 'md-render-frozen))))))
 
+(ert-deftest md-render-table-measure-preserves-source-when-point-moves ()
+  (dolist (modified '(nil t))
+    (with-temp-buffer
+      (save-window-excursion
+        (switch-to-buffer (current-buffer))
+        (insert "Original buffer text\n")
+        (set-buffer-modified-p modified)
+        (let ((before (buffer-string)))
+          (cl-letf (((symbol-function 'window-text-pixel-size)
+                     (lambda (&rest _)
+                       (goto-char (point-min))
+                       '(42 . 10))))
+            (should (= 42 (md-render--table-measure-string
+                           (copy-sequence "probe") (selected-window)))))
+          (should (equal-including-properties before (buffer-string)))
+          (should (eq modified (buffer-modified-p))))))))
+
+(ert-deftest md-render-table-measure-cleans-probe-on-error ()
+  (dolist (modified '(nil t))
+    (with-temp-buffer
+      (save-window-excursion
+        (switch-to-buffer (current-buffer))
+        (insert "Original buffer text\n")
+        (set-buffer-modified-p modified)
+        (let ((before (buffer-string)))
+          (cl-letf (((symbol-function 'window-text-pixel-size)
+                     (lambda (&rest _)
+                       (goto-char (point-min))
+                       (error "Test measurement failure"))))
+            (should-error (md-render--table-measure-string
+                           (copy-sequence "probe") (selected-window))))
+          (should (equal-including-properties before (buffer-string)))
+          (should (eq modified (buffer-modified-p))))))))
+
 (provide 'md-render-tests)
 
 ;;; md-render-tests.el ends here

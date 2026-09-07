@@ -2497,30 +2497,25 @@ preserved so callers never observe the mutation."
   (with-current-buffer (window-buffer window)
     (let ((inhibit-read-only t)
           (inhibit-modification-hooks t)
-          (modified (buffer-modified-p))
-          real)
+          (modified (buffer-modified-p)))
       (save-excursion
         (goto-char (point-max))
-        (let ((m (point-marker)))
-          (set-marker-insertion-type m nil)
-          (insert str)
-          ;; Mark the probe `fontified' so the display iterator doesn't
-          ;; run font-lock over it — fontifying would strip the pinned
-          ;; `fixed-pitch' face and measure in the buffer's remapped
-          ;; default face (variable-pitch).
-          (put-text-property m (point) 'fontified t)
-          ;; Strip `line-prefix' / `wrap-prefix' before measuring
-          (remove-text-properties m (point) '(line-prefix nil wrap-prefix nil))
-          ;; X-LIMIT keeps `window-text-pixel-size' from clipping the
-          ;; measurement at the window width — long cells (wide tables)
-          ;; would otherwise under-measure their natural column widths.
-          (setq real (car (window-text-pixel-size
-                           window m (point)
-                           md-render--table-measure-x-limit)))
-          (delete-region m (point))
-          (set-marker m nil)))
-      (set-buffer-modified-p modified)
-      real)))
+        (let ((beg (point)) end)
+          (unwind-protect
+              (progn
+                (insert str)
+                (setq end (point))
+                ;; Keep font-lock from stripping the pinned fixed-pitch face.
+                (put-text-property beg end 'fontified t)
+                (remove-text-properties beg end
+                                        '(line-prefix nil wrap-prefix nil))
+                ;; Do not clip measurements to the window width.
+                (car (window-text-pixel-size
+                      window beg end md-render--table-measure-x-limit)))
+            ;; Redisplay may move point; clean up only the inserted probe,
+            ;; including when measurement signals an error.
+            (when end (delete-region beg end))
+            (set-buffer-modified-p modified)))))))
 
 (defun md-render--table-char-pixel-width (window)
   "Return real pixel width of a single space in WINDOW, cached.
