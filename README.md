@@ -21,6 +21,10 @@ It provides two views of the same buffer:
 
 [Watch the complete 87-second demo](docs/demo.mp4).
 
+[Watch rendered tables with mixed CJK, emoji and code cells reflow while the
+window is resized](https://github.com/yibie/md-mode/releases/download/v0.4.1/md-mode-0.4.1-table-resize.mp4)
+(0.4.1 release).
+
 ## Why md-mode?
 
 - **Styled while editable.** Heading scale, emphasis, code, links, quotes,
@@ -202,9 +206,14 @@ and after text scaling; ordinary scrolling does not relayout them.  Layout
 cost grows roughly linearly with table size.  In a four-column mixed CJK/ASCII
 benchmark, a 100-row table took about 43 ms to render and 46 ms to relayout;
 300 rows took about 90–95 ms, and 1,000 rows about 290 ms.  Large tables remain
-cheap to restore to source (about 2 ms at 1,000 rows), but continuously
-resizing a window containing several hundred rows may produce a visible
-pause.  When the same buffer is visible in windows of different widths,
+cheap to restore to source (about 2 ms at 1,000 rows).  Window resizes are
+debounced: layout runs once the resize has been idle for
+`md-mode-table-relayout-delay` seconds (0.15 by default) instead of on every
+drag step, and cell measurements are cached per buffer, so repeated relayouts
+of the same table only measure text that wraps at new positions.  Column
+widths start from each column's longest unbreakable token (capped at half the
+available width), so short columns keep their natural width instead of being
+squeezed to one character by a very long neighbour.  When the same buffer is visible in windows of different widths,
 automatic relayout is skipped because one text buffer cannot hold two
 different physical layouts simultaneously.
 
@@ -245,6 +254,7 @@ Editing and structure:
 | `md-mode-toc-side` | `left` | Open the TOC on the left or right |
 | `md-mode-toc-width` | `30` | Set the TOC width in columns |
 | `md-mode-heading-scaling-values` | `(2.0 1.7 1.4 1.1 1.0 1.0)` | Set relative sizes for heading levels one through six |
+| `md-mode-table-relayout-delay` | `0.15` | Idle seconds to wait after a window resize before relaying out rendered tables; `0` relayouts immediately |
 
 Rendered images and tables:
 
@@ -351,6 +361,18 @@ fallback family without `:size`:
 The fallback font will still inherit the default body size, while headings
 scale normally. The same rule applies to Org and `markdown-mode` heading
 faces.
+
+Rendered tables are measured with the `fixed-pitch` face.  If your
+configuration sets only the `default` font (for example Iosevka) and leaves
+`fixed-pitch` on its stock family (Courier on macOS), the two fonts have
+different character widths and table widths are computed from a mismatched
+column count.  md-mode clamps the table to the window's pixel width in that
+case, but setting both faces to the same family avoids the mismatch entirely:
+
+```elisp
+(set-face-attribute 'default nil :family "Iosevka")
+(set-face-attribute 'fixed-pitch nil :family "Iosevka")
+```
 
 Here is a ready-to-copy configuration with the main commands grouped under
 `C-c m`; replace the keys to match your setup:

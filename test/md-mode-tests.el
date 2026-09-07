@@ -37,6 +37,46 @@
      (list (get-text-property position 'face)
            (get-text-property position 'font-lock-face)))))
 
+(defun md-mode-tests--table-test-char-pixels (char)
+  "Return deterministic test pixel width for CHAR."
+  (cond
+   ((eq char ?│) 5)
+   ((memq char '(?┌ ?┐ ?└ ?┘)) 7)
+   ((memq char '(?┬ ?├ ?┼ ?┤ ?┴)) 9)
+   ((eq char ?─) 6)
+   ((> char 127) 17)
+   (t 10)))
+
+(defun md-mode-tests--table-test-string-pixels (string)
+  "Return deterministic rendered pixel width of STRING."
+  (let ((pixels 0))
+    (dotimes (index (length string))
+      (let ((display (get-text-property index 'display string)))
+        (setq pixels
+              (+ pixels
+                 (if (and (listp display)
+                          (eq (car display) 'space)
+                          (eq (cadr display) :width))
+                     (let ((width (caddr display)))
+                       (if (listp width) (car width) width))
+                   (md-mode-tests--table-test-char-pixels
+                    (aref string index)))))))
+    pixels))
+
+(defun md-mode-tests--table-test-border-offsets (line)
+  "Return pixel offsets of borders and junctions in LINE."
+  (let ((pixels 0)
+        offsets)
+    (dotimes (index (length line))
+      (let ((char (aref line index)))
+        (when (memq char '(?┌ ?┬ ?┐ ?├ ?┼ ?┤ ?└ ?┴ ?┘ ?│))
+          (push pixels offsets))
+        (setq pixels
+              (+ pixels
+                 (md-mode-tests--table-test-string-pixels
+                  (substring line index (1+ index)))))))
+    (nreverse offsets)))
+
 (defun md-mode-tests--imenu-shape (index)
   "Return INDEX titles and hierarchy without target markers."
   (mapcar
@@ -1394,6 +1434,8 @@
       (md-mode-render)
       (should (string-match-p "Before\\." (buffer-string)))
       (should (string-match-p "After\\." (buffer-string)))
+      (should (string-match-p (rx line-start "┌") (buffer-string)))
+      (should (string-match-p (rx "┘" line-end) (buffer-string)))
       (should (= (length md-mode--table-widgets) 1))
       (let* ((widget (car md-mode--table-widgets))
              (from (widget-get widget :from))
@@ -1408,6 +1450,284 @@
       (md-mode-show-source)
       (should-not md-mode--table-widgets)
       (should (equal (buffer-string) source)))))
+
+(ert-deftest md-mode-table-widget-aligns-mixed-font-borders-in-pixels ()
+  (with-temp-buffer
+    (let* ((source (concat "| Module | Target | State |\n"
+                           "| --- | --- | --- |\n"
+                           "| ASCII | mixed 中文 | ready |\n"
+                           "| 中文 | plain text | 完成 |\n"))
+           (widget (widget-convert 'md-render-table-widget :value source))
+           (md-render-table-wrap-columns t))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+                ((symbol-function 'md-render--table-char-pixel-width)
+                 (lambda (_) 10))
+                ((symbol-function 'md-render--table-measure-string)
+                 (lambda (string _)
+                   (md-mode-tests--table-test-string-pixels string))))
+        (let ((wide (md-render--table-widget-layout widget 72))
+              (narrow (md-render--table-widget-layout widget 20)))
+          (should-not (equal wide narrow))
+          (dolist (rendered (list wide narrow))
+            (let* ((lines (split-string rendered "\n"))
+                   (expected (md-mode-tests--table-test-border-offsets
+                              (car lines))))
+              (should (eq (aref (car lines) 0) ?┌))
+              (should (eq (aref (car (last lines)) 0) ?└))
+              (should (= (length expected) 4))
+              (dolist (line lines)
+                (should (equal
+                         (md-mode-tests--table-test-border-offsets line)
+                         expected))))))))))
+
+(ert-deftest md-mode-table-widget-preserves-gfm-alignment-in-pixels ()
+  (with-temp-buffer
+    (let* ((source (concat "| LeftWide | RightWide | CenterWide |\n"
+                           "| :--- | ---: | :---: |\n"
+                           "| x | y | 中 |\n"))
+           (widget (widget-convert 'md-render-table-widget :value source)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+                ((symbol-function 'md-render--table-char-pixel-width)
+                 (lambda (_) 10))
+                ((symbol-function 'md-render--table-measure-string)
+                 (lambda (string _)
+                   (md-mode-tests--table-test-string-pixels string))))
+        (let* ((rendered (md-render--table-widget-layout widget 72))
+               (line (seq-find (lambda (candidate)
+                                 (string-match-p (rx "x") candidate))
+                               (split-string rendered "\n")))
+               (borders (md-mode-tests--table-test-border-offsets line))
+               (x-index (string-match (rx "x") line))
+               (y-index (string-match (rx "y") line))
+               (cjk-index (string-match (rx "中") line))
+               (x-start (md-mode-tests--table-test-string-pixels
+                         (substring line 0 x-index)))
+               (y-start (md-mode-tests--table-test-string-pixels
+                         (substring line 0 y-index)))
+               (cjk-start (md-mode-tests--table-test-string-pixels
+                           (substring line 0 cjk-index)))
+               (boundary-width
+                (apply #'max
+                       (mapcar #'md-mode-tests--table-test-char-pixels
+                               '(?│ ?┌ ?┬ ?┐ ?├ ?┼ ?┤ ?└ ?┴ ?┘)))))
+          (should (= (- x-start (nth 0 borders) boundary-width) 10))
+          (should (= (- (nth 2 borders) y-start 10) 10))
+          (should (<= (abs (- (- cjk-start (nth 2 borders) boundary-width)
+                              (- (nth 3 borders) cjk-start 17)))
+                      10)))))))
+
+(ert-deftest md-mode-table-widget-navigation-survives-framing ()
+  (with-temp-buffer
+    (insert "| Name | Value |\n| --- | --- |\n| A | B |\n")
+    (md-mode)
+    (md-mode-render)
+    (goto-char (point-min))
+    (search-forward "Name")
+    (backward-char)
+    (md-render-table-next-cell)
+    (should (looking-at-p "Value"))
+    (md-render-table-next-cell)
+    (should (looking-at-p "A"))))
+
+(ert-deftest md-mode-table-widget-narrow-rows-fit-rules-in-pixels ()
+  (with-temp-buffer
+    (let* ((source (concat "| 名称 | 状态 |\n| --- | --- |\n"
+                           "| 超长中文内容😀😀 | ready |\n"))
+           (widget (widget-convert 'md-render-table-widget :value source)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+                ((symbol-function 'md-render--table-char-pixel-width)
+                 (lambda (_) 10))
+                ((symbol-function 'md-render--table-measure-string)
+                 (lambda (string _)
+                   (md-mode-tests--table-test-string-pixels string))))
+        (let* ((lines (split-string
+                       (md-render--table-widget-layout widget 12) "\n"))
+               (rule-width (md-mode-tests--table-test-string-pixels
+                            (car lines))))
+          (dolist (line lines)
+            (should (<= (md-mode-tests--table-test-string-pixels line)
+                        rule-width))))))))
+
+(ert-deftest md-mode-table-widget-budget-never-exceeds-window-pixels ()
+  "A `fixed-pitch' wider than the frame font must not widen the table.
+`window-body-width' counts 7px Iosevka columns here while the
+mocked `fixed-pitch' space measures 10px; the budget must clamp to
+the window's 700 real pixels instead of 1000."
+  (with-temp-buffer
+    (let* ((source (concat "| 模块 | 目标 | 要做 |\n| --- | --- | --- |\n"
+                           "| A | short | 用户面只留 sync-status "
+                           "force-resync-current-file full-rescan |\n"))
+           (widget (widget-convert 'md-render-table-widget :value source)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+                ((symbol-function 'md-render--table-char-pixel-width)
+                 (lambda (_) 10))
+                ((symbol-function 'md-render--table-measure-string)
+                 (lambda (string _)
+                   (md-mode-tests--table-test-string-pixels string)))
+                ((symbol-function 'window-body-width)
+                 (lambda (&optional _window pixelwise)
+                   (if pixelwise 700 100))))
+        (should (= (md-render--table-widget-pixel-budget 100 (selected-window))
+                   700))
+        ;; A narrower request keeps the measured unit.
+        (should (= (md-render--table-widget-pixel-budget 50 (selected-window))
+                   500))
+        (dolist (line (split-string
+                       (md-render--table-widget-layout widget 100) "\n"))
+          (should (<= (md-mode-tests--table-test-string-pixels line) 700)))))))
+
+(defmacro md-mode-tests--with-table-pixel-mocks (&rest body)
+  "Run BODY with deterministic table pixel measurement."
+  `(cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+             ((symbol-function 'md-render--table-char-pixel-width)
+              (lambda (_) 10))
+             ((symbol-function 'md-render--table-measure-string)
+              (lambda (string _)
+                (md-mode-tests--table-test-string-pixels string))))
+     ,@body))
+
+(ert-deftest md-mode-table-widget-longest-token-pixels ()
+  (md-mode-tests--with-table-pixel-mocks
+   (should (= (md-render--table-widget-longest-token-pixels
+               "reindex 删节点走 supertag-node-delete 级联删" nil)
+              200))
+   ;; CJK characters break after each other; a run of them never
+   ;; forms one token.
+   (should (= (md-render--table-widget-longest-token-pixels
+               "用户面只留" nil)
+              17))
+   (should (= (md-render--table-widget-longest-token-pixels "" nil) 0))))
+
+(ert-deftest md-mode-table-widget-short-columns-keep-natural-width ()
+  "One giant cell must not starve the short columns.
+Column 1 and 2 need 74px and 135px; the third column's 4000px cell
+used to take 96% of the flexible space and squeeze them to a
+character per line."
+  (with-temp-buffer
+    (let* ((paragraph (mapconcat (lambda (_) "xxxxxxxxx")
+                                 (number-sequence 1 40) " "))
+           (source (concat "| 模块 | 目标 | 要做 |\n| --- | --- | --- |\n"
+                           "| A 存储 | DB 是文本投影 | " paragraph " |\n"))
+           (widget (widget-convert 'md-render-table-widget :value source)))
+      (md-mode-tests--with-table-pixel-mocks
+       (let* ((lines (split-string
+                      (md-render--table-widget-layout widget 100) "\n"))
+              (first-data (nth 3 lines))
+              (offsets (md-mode-tests--table-test-border-offsets first-data)))
+         (should (string-match-p "A 存储" first-data))
+         (should (string-match-p "DB 是文本投影" first-data))
+         ;; The paragraph column is still the widest one.
+         (should (> (- (nth 3 offsets) (nth 2 offsets))
+                    (- (nth 2 offsets) (nth 1 offsets)))))))))
+
+(ert-deftest md-mode-table-widget-minimum-keeps-unbreakable-token ()
+  "A column is never narrower than its longest word when that fits."
+  (with-temp-buffer
+    (let* ((source (concat "| 名称 | 说明 |\n| --- | --- |\n"
+                           "| supertag-node-delete | "
+                           "这是一段很长的中文说明文字用来占满剩余的宽度并且需要换行才能显示完整 |\n"))
+           (widget (widget-convert 'md-render-table-widget :value source)))
+      (md-mode-tests--with-table-pixel-mocks
+       (let* ((lines (split-string
+                      (md-render--table-widget-layout widget 60) "\n"))
+              (first-data (nth 3 lines)))
+         (should (string-match-p "supertag-node-delete" first-data)))))))
+
+(ert-deftest md-mode-table-widget-no-wrap-keeps-natural-pixel-width ()
+  (with-temp-buffer
+    (let* ((source (concat "| Name | Description |\n| --- | --- |\n"
+                           "| A | 中文 and a long natural-width value |\n"))
+           (widget (widget-convert 'md-render-table-widget :value source))
+           (md-render-table-wrap-columns nil))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+                ((symbol-function 'md-render--table-char-pixel-width)
+                 (lambda (_) 10))
+                ((symbol-function 'md-render--table-measure-string)
+                 (lambda (string _)
+                   (md-mode-tests--table-test-string-pixels string))))
+        (should (equal (md-render--table-widget-layout widget 12)
+                       (md-render--table-widget-layout widget 80)))))))
+
+(ert-deftest md-mode-table-widget-wrap-keeps-graphemes-intact ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'md-render--table-measure-string)
+               (lambda (string _)
+                 (* 10 (length string)))))
+      (dolist (grapheme '("👨‍👩‍👧‍👦" "🇨🇳" "👍🏽" "1️⃣"))
+        (should (equal (md-render--table-widget-wrap-pixels
+                        grapheme 10 (selected-window))
+                       (list grapheme)))))))
+
+(ert-deftest md-mode-table-widget-navigation-skips-synthetic-padding ()
+  (with-temp-buffer
+    (insert "| Right | Center |\n| ---: | :---: |\n| r | c |\n")
+    (md-mode)
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+              ((symbol-function 'md-render--table-char-pixel-width)
+               (lambda (_) 10))
+              ((symbol-function 'md-render--table-measure-string)
+               (lambda (string _)
+                 (md-mode-tests--table-test-string-pixels string))))
+      (md-mode-render))
+    (goto-char (point-min))
+    (search-forward "Right")
+    (backward-char)
+    (md-render-table-next-cell)
+    (should (looking-at-p "Center"))
+    (md-render-table-next-cell)
+    (should (looking-at-p "r"))
+    (should-not (get-text-property (point)
+                                   'md-render-table-synthetic-spacing))
+    (md-render-table-next-cell)
+    (should (looking-at-p "c"))
+    (should-not (get-text-property (point)
+                                   'md-render-table-synthetic-spacing))))
+
+(ert-deftest md-mode-table-widget-navigation-visits-empty-cells ()
+  (with-temp-buffer
+    (insert "| A | B | C |\n| --- | --- | --- |\n| | middle | |\n")
+    (md-mode)
+    (md-mode-render)
+    (goto-char (point-min))
+    (search-forward "A")
+    (backward-char)
+    (let ((positions (list (point))))
+      (dotimes (_ 5)
+        (md-render-table-next-cell)
+        (push (point) positions)
+        (should (get-text-property (point) 'md-render-table-cell-start)))
+      (setq positions (nreverse positions))
+      (should (= (length positions) 6))
+      (should (= (length (delete-dups (copy-sequence positions))) 6))
+      (should (looking-at-p (rx (or space "│"))))
+      (dotimes (index 5)
+        (md-render-table-previous-cell)
+        (should (= (point) (nth (- 4 index) positions))))
+      (should (looking-at-p "A")))))
+
+(ert-deftest md-mode-table-widget-large-table-measurement-is-bounded ()
+  (with-temp-buffer
+    (let* ((header "| A | B | C | D | E |\n| --- | --- | --- | --- | --- |\n")
+           (rows (mapconcat
+                  (lambda (row)
+                    (format "| row-%d-a | row-%d-b | 中文%d | value | done |"
+                            row row row))
+                  (number-sequence 1 100) "\n"))
+           (widget (widget-convert
+                    'md-render-table-widget :value (concat header rows "\n")))
+           (measurements 0))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+                ((symbol-function 'md-render--table-char-pixel-width)
+                 (lambda (_) 10))
+                ((symbol-function 'md-render--table-measure-string)
+                 (lambda (string _)
+                   (setq measurements (1+ measurements))
+                   (md-mode-tests--table-test-string-pixels string))))
+        (md-render--table-widget-layout widget 100)
+        ;; Keep the coarse bound linear in the 500-cell input.  It allows
+        ;; grapheme and wrapping probes, but catches accidental full-table
+        ;; remeasurement inside the per-cell loop.
+        (should (< measurements 2500))))))
 
 (ert-deftest md-mode-render-rebuilds-table-widget ()
   (with-temp-buffer
@@ -1464,6 +1784,53 @@
                    (md-render--table-widget-layout widget width))))
         (md-mode--refresh-table-widget-layout-after-scale))
       (should (= calls 1)))))
+
+(ert-deftest md-mode-window-resize-debounces-table-widget-relayout ()
+  "A resize schedules one idle relayout instead of relaying out inline."
+  (with-temp-buffer
+    (insert "| A | B |\n| --- | --- |\n| C | D |\n")
+    (md-mode)
+    (cl-letf (((symbol-function 'md-mode--render-width) (lambda () 40)))
+      (md-mode-render))
+    (let ((calls 0)
+          (md-mode-table-relayout-delay 0.15))
+      (cl-letf (((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) (list (selected-window))))
+                ((symbol-function 'window-body-width) (lambda (&rest _) 30))
+                ((symbol-function 'md-mode--refresh-table-widget-layout)
+                 (lambda (&optional _) (setq calls (1+ calls)))))
+        (md-mode--schedule-table-widget-relayout)
+        (md-mode--schedule-table-widget-relayout)
+        (should (= calls 0))
+        (should (timerp md-mode--table-relayout-timer))
+        (md-mode--run-table-relayout (current-buffer))
+        (should (= calls 1))
+        (should-not md-mode--table-relayout-timer)
+        ;; A zero delay relays out inline.
+        (let ((md-mode-table-relayout-delay 0))
+          (md-mode--schedule-table-widget-relayout)
+          (should (= calls 2))
+          (should-not md-mode--table-relayout-timer))))))
+
+(ert-deftest md-mode-table-widget-reuses-measurements-across-layouts ()
+  "A second layout in the same buffer measures nothing new."
+  (with-temp-buffer
+    (let* ((source (concat "| 模块 | 说明 |\n| --- | --- |\n"
+                           "| Parser | 支持 GFM 表格，长行按窗口宽度自动换行。 |\n"))
+           (widget (widget-convert 'md-render-table-widget :value source))
+           (calls 0))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+                ((symbol-function 'md-render--table-char-pixel-width)
+                 (lambda (_) 10))
+                ((symbol-function 'md-render--table-measure-string)
+                 (lambda (string _)
+                   (setq calls (1+ calls))
+                   (md-mode-tests--table-test-string-pixels string))))
+        (let ((first (md-render--table-widget-layout widget 40)))
+          (should (> calls 0))
+          (setq calls 0)
+          (should (equal (md-render--table-widget-layout widget 40) first))
+          (should (= calls 0)))))))
 
 (ert-deftest md-mode-show-source-keeps-current-rendered-position ()
   (with-temp-buffer

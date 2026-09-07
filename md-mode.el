@@ -5,7 +5,7 @@
 ;; Author: LuciusChen <https://github.com/yibie>
 ;; Assisted-by: Codex:gpt-5.5
 ;; URL: https://github.com/yibie/md-mode
-;; Version: 0.4.0
+;; Version: 0.4.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: wp, convenience
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -59,6 +59,9 @@
 (defvar-local md-mode--table-widget-width nil
   "Width used for table widgets in the current rendered view.")
 
+(defvar-local md-mode--table-relayout-timer nil
+  "Idle timer pending a table widget relayout, or nil.")
+
 (defcustom md-mode-auto-align-tables nil
   "When non-nil, align Markdown tables when entering `md-mode'."
   :type 'boolean
@@ -68,6 +71,17 @@
   "When non-nil, fold front matter when entering `md-mode'."
   :type 'boolean
   :group 'md)
+
+(defcustom md-mode-table-relayout-delay 0.15
+  "Seconds of idle time before rendered tables follow a window resize.
+
+Relaying out a large table measures thousands of strings, so
+doing it synchronously on every step of a window drag makes the
+drag feel sluggish.  Resizes are debounced by this delay: the
+tables keep their previous layout while the window is moving and
+relayout once it settles.  Set to 0 to relayout immediately."
+  :type 'number
+  :group 'md-mode)
 
 (defcustom md-mode-clip-wide-tables nil
   "When non-nil, clip table rows wider than the window.
@@ -2333,8 +2347,45 @@ Applies to both the edit and the rendered view."
   "Detach all table widgets from the current buffer."
   (dolist (widget md-mode--table-widgets)
     (widget-delete widget))
+  (md-mode--cancel-table-relayout)
   (setq md-mode--table-widgets nil
         md-mode--table-widget-width nil))
+
+(defun md-mode--cancel-table-relayout ()
+  "Cancel a pending debounced table widget relayout."
+  (when md-mode--table-relayout-timer
+    (cancel-timer md-mode--table-relayout-timer)
+    (setq md-mode--table-relayout-timer nil)))
+
+(defun md-mode--table-relayout-needed-p ()
+  "Return non-nil when the visible window width no longer matches the tables."
+  (when (and md-mode--rendered-p md-mode--table-widgets)
+    (let ((widths (delete-dups
+                   (mapcar #'window-body-width
+                           (get-buffer-window-list (current-buffer) nil t)))))
+      (and (= (length widths) 1)
+           (not (equal (car widths) md-mode--table-widget-width))))))
+
+(defun md-mode--run-table-relayout (buffer)
+  "Run the debounced table widget relayout in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq md-mode--table-relayout-timer nil)
+      (md-mode--refresh-table-widget-layout))))
+
+(defun md-mode--schedule-table-widget-relayout ()
+  "Relayout table widgets after the window stops resizing.
+Runs from `window-configuration-change-hook'.  Each call restarts
+the `md-mode-table-relayout-delay' idle timer, so a drag produces
+one relayout when it ends instead of one per step."
+  (when (md-mode--table-relayout-needed-p)
+    (md-mode--cancel-table-relayout)
+    (if (<= md-mode-table-relayout-delay 0)
+        (md-mode--refresh-table-widget-layout)
+      (setq md-mode--table-relayout-timer
+            (run-with-idle-timer md-mode-table-relayout-delay nil
+                                 #'md-mode--run-table-relayout
+                                 (current-buffer))))))
 
 (defun md-mode--attach-table-widgets ()
   "Replace rendered table strings with width-aware table widgets."
@@ -2571,7 +2622,7 @@ When FORCE is non-nil, relayout even when the character width is unchanged."
   (add-hook 'window-configuration-change-hook
             #'md-mode--truncate-tables-in-buffer nil t)
   (add-hook 'window-configuration-change-hook
-            #'md-mode--refresh-table-widget-layout nil t)
+            #'md-mode--schedule-table-widget-relayout nil t)
   (add-hook 'text-scale-mode-hook
             #'md-mode--truncate-tables-in-buffer nil t)
   (add-hook 'text-scale-mode-hook

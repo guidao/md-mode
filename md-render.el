@@ -258,15 +258,63 @@ edge and the view follows the cursor as it moves right
   :type 'boolean
   :group 'md-render)
 
+(defvar-local md-render--table-widget-measure-cache nil
+  "Pixel measurements reused across table widget layouts.
+A cons (VALIDITY . TABLE): TABLE maps a printed string to its
+pixel width, VALIDITY records the font state and measuring
+function it was collected under.  Lives in the buffer whose window
+measures the tables.")
+
+(defconst md-render--table-widget-measure-cache-limit 50000
+  "Entries after which `md-render--table-widget-measure-cache' restarts.")
+
+(defun md-render--table-widget-measurements (window measure)
+  "Return the measurement table for WINDOW valid under MEASURE.
+A string's pixel width depends only on the fonts, not on the
+window width, so measurements survive relayouts; the table is
+dropped when the window font, the `fixed-pitch' font, or the
+measuring function changes."
+  (with-current-buffer (window-buffer window)
+    (let ((validity (list (ignore-errors (window-font-width window))
+                          (ignore-errors (face-font 'fixed-pitch))
+                          measure)))
+      (unless (and md-render--table-widget-measure-cache
+                   (equal (car md-render--table-widget-measure-cache)
+                          validity)
+                   (< (hash-table-count
+                       (cdr md-render--table-widget-measure-cache))
+                      md-render--table-widget-measure-cache-limit))
+        (setq md-render--table-widget-measure-cache
+              (cons validity (make-hash-table :test 'equal))))
+      (cdr md-render--table-widget-measure-cache))))
+
 (defun md-render--table-widget-layout (widget width)
   "Lay out table WIDGET within WIDTH columns."
-  (let ((md-render-table-max-width-fraction 1.0)
-        (source (widget-get widget :value))
+  (let ((source (widget-get widget :value))
         (window (or (get-buffer-window (current-buffer))
                     (selected-window))))
-    (cl-letf (((symbol-function 'md-render--display-width)
-               (lambda () width)))
-      (md-render--render-table-source :source source :window window))))
+    (if (and (window-live-p window)
+             (display-graphic-p)
+             (fboundp 'window-text-pixel-size))
+        (let* ((measure (symbol-function 'md-render--table-measure-string))
+               (measurements (md-render--table-widget-measurements
+                              window measure)))
+          (cl-letf (((symbol-function 'md-render--table-measure-string)
+                     (lambda (string destination)
+                       (let* ((key (prin1-to-string string))
+                              (cached (gethash key measurements 'missing)))
+                         (if (eq cached 'missing)
+                             (let ((pixels (funcall measure string destination)))
+                               (puthash key pixels measurements)
+                               pixels)
+                           cached)))))
+            (md-render--render-table-widget-source
+             :source source :window window :width width)))
+      (let ((md-render-table-max-width-fraction 1.0))
+        (cl-letf (((symbol-function 'md-render--display-width)
+                   (lambda () width)))
+          (md-render--render-table-source
+           :source source :window window :framed t))))))
 
 (defun md-render--table-widget-attach (widget from to)
   "Attach table WIDGET to the rendered text from FROM to TO."
@@ -2925,20 +2973,23 @@ SEPARATOR-ROW-NUM identifies the row separating headers from data."
            (= (mod data-row-num 2) 1))
       'md-render-table-zebra))))
 
-(defun md-render--render-table-separator-row (col-widths)
-  "Build the rendered separator line for COL-WIDTHS."
-  (let ((pipe (if md-render-table-use-unicode-borders "┼" "|"))
-        (left (if md-render-table-use-unicode-borders "├" "|"))
-        (right (if md-render-table-use-unicode-borders "┤" "|")))
+(defun md-render--render-table-rule (col-widths left join right)
+  "Build a table rule for COL-WIDTHS using LEFT, JOIN, and RIGHT."
+  (let ((styled-join (propertize join 'face 'md-render-table-border)))
     (concat
      (propertize left 'face 'md-render-table-border)
      (mapconcat
-      (lambda (w)
-        (propertize (md-render--make-table-separator-cell (+ w 2))
+      (lambda (width)
+        (propertize (md-render--make-table-separator-cell (+ width 2))
                     'face 'md-render-table-border))
-      col-widths
-      (propertize pipe 'face 'md-render-table-border))
+      col-widths styled-join)
      (propertize right 'face 'md-render-table-border))))
+
+(defun md-render--render-table-separator-row (col-widths)
+  "Build the rendered separator line for COL-WIDTHS."
+  (if md-render-table-use-unicode-borders
+      (md-render--render-table-rule col-widths "├" "┼" "┤")
+    (md-render--render-table-rule col-widths "|" "|" "|")))
 
 (cl-defun md-render--render-table-data-row
     (&key processed-cells col-widths alignments row-face window)
@@ -3271,7 +3322,390 @@ the language label above the body copies its own body via RET."
           pos 'md-render-source-block-body)
          (point-max)))))
 
-(cl-defun md-render--render-table-source (&key source window)
+(defun md-render--table-widget-pixel-space (pixels)
+  "Return an invisible display space occupying PIXELS."
+  (if (> pixels 0)
+      (propertize "\u200B" 'display `(space :width (,pixels))
+                  'md-render-table-synthetic-spacing t)
+    ""))
+
+(defun md-render--table-widget-boundary (glyph pixels window)
+  "Return GLYPH normalized to PIXELS of horizontal advance in WINDOW."
+  (let ((glyph-pixels (md-render--table-measure-string glyph window)))
+    (concat (propertize glyph 'face 'md-render-table-border)
+            (md-render--table-widget-pixel-space
+             (max 0 (- pixels glyph-pixels))))))
+
+(defun md-render--table-widget-boundary-pixels (window)
+  "Return one normalized boundary width for all table glyphs in WINDOW."
+  (apply #'max
+         (mapcar (lambda (glyph)
+                   (md-render--table-measure-string glyph window))
+                 (if md-render-table-use-unicode-borders
+                     '("│" "┌" "┬" "┐" "├" "┼" "┤" "└" "┴" "┘")
+                   '("|" "+")))))
+
+(defun md-render--table-widget-rule-segment (pixels window)
+  "Return a horizontal rule occupying PIXELS in WINDOW."
+  (let* ((glyph (if md-render-table-use-unicode-borders "─" "-"))
+         (glyph-pixels (max 1 (md-render--table-measure-string glyph window)))
+         (count (floor (/ (float pixels) glyph-pixels)))
+         (remainder (- pixels (* count glyph-pixels))))
+    (propertize
+     (concat (make-string count (string-to-char glyph))
+             (md-render--table-widget-pixel-space remainder))
+     'face 'md-render-table-border)))
+
+(defun md-render--table-widget-rule
+    (widths left join right boundary-pixels window)
+  "Build a pixel-accurate rule for WIDTHS in WINDOW.
+LEFT, JOIN, and RIGHT are normalized to BOUNDARY-PIXELS."
+  (concat
+   (md-render--table-widget-boundary left boundary-pixels window)
+   (mapconcat
+    (lambda (width)
+      (md-render--table-widget-rule-segment width window))
+    widths (md-render--table-widget-boundary
+            join boundary-pixels window))
+   (md-render--table-widget-boundary right boundary-pixels window)))
+
+(defun md-render--table-widget-regional-indicator-p (char)
+  "Return non-nil when CHAR is a regional-indicator symbol."
+  (<= #x1F1E6 char #x1F1FF))
+
+(defun md-render--table-widget-grapheme-extension-p (char)
+  "Return non-nil when CHAR extends the preceding grapheme."
+  (or (zerop (char-width char))
+      (<= #x1F3FB char #x1F3FF)))
+
+(defun md-render--table-widget-next-grapheme-end (text start)
+  "Return the end of the extended grapheme in TEXT starting at START."
+  (let* ((length (length text))
+         (end (1+ start)))
+    (when (and (md-render--table-widget-regional-indicator-p
+                (seq-elt text start))
+               (< end length)
+               (md-render--table-widget-regional-indicator-p
+                (seq-elt text end)))
+      (setq end (1+ end)))
+    (while (and (< end length)
+                (md-render--table-widget-grapheme-extension-p
+                 (seq-elt text end))
+                (not (= (seq-elt text end) #x200D)))
+      (setq end (1+ end)))
+    (while (and (< end length) (= (seq-elt text end) #x200D))
+      (setq end (min length (+ end 2)))
+      (while (and (< end length)
+                  (md-render--table-widget-grapheme-extension-p
+                   (seq-elt text end))
+                  (not (= (seq-elt text end) #x200D)))
+        (setq end (1+ end))))
+    end))
+
+(defun md-render--table-widget-grapheme-ends (text start)
+  "Return grapheme end positions in TEXT following START."
+  (let ((position start)
+        ends)
+    (while (< position (length text))
+      (setq position
+            (md-render--table-widget-next-grapheme-end text position))
+      (push position ends))
+    (nreverse ends)))
+
+(defun md-render--table-widget-fit-end (text start pixels window)
+  "Return the longest end of TEXT after START fitting PIXELS in WINDOW."
+  (let* ((ends (vconcat (md-render--table-widget-grapheme-ends text start)))
+         (low 0)
+         (high (1- (length ends)))
+         (best (aref ends 0)))
+    (while (<= low high)
+      (let* ((mid (/ (+ low high) 2))
+             (end (aref ends mid))
+             (measured (md-render--table-measure-string
+                        (substring text start end) window)))
+        (if (<= measured pixels)
+            (setq best end low (1+ mid))
+          (setq high (1- mid)))))
+    best))
+
+(defun md-render--table-widget-break-end (text start end)
+  "Move END to a natural break in TEXT without crossing START."
+  (let ((scan (1- end))
+        break)
+    (while (and (> scan start) (not break))
+      (when (or (memq (seq-elt text scan) '(?\s ?\t))
+                (and (< scan (1- (length text)))
+                     (md-render--table-break-after-p text scan)))
+        (setq break (1+ scan)))
+      (setq scan (1- scan)))
+    (or break end)))
+
+(defun md-render--table-widget-wrap-pixels (text pixels window)
+  "Wrap TEXT into lines no wider than PIXELS in WINDOW."
+  (if (or (string-empty-p text)
+          (<= (md-render--table-measure-string text window) pixels))
+      (list text)
+    (let ((position 0)
+          (text-length (length text))
+          lines)
+      (while (< position text-length)
+        (let* ((fit (md-render--table-widget-fit-end
+                     text position pixels window))
+               (end (if (< fit text-length)
+                        (md-render--table-widget-break-end text position fit)
+                      fit)))
+          (push (string-trim-right (substring text position end)) lines)
+          (setq position end)
+          (while (and (< position text-length)
+                      (memq (seq-elt text position) '(?\s ?\t)))
+            (setq position (1+ position)))))
+      (nreverse lines))))
+
+(cl-defun md-render--table-widget-pad
+    (&key text pixels window (alignment 'left))
+  "Pad TEXT to PIXELS in WINDOW according to ALIGNMENT."
+  (let* ((used (md-render--table-measure-string text window))
+         (padding (max 0 (- pixels used)))
+         (widths (md-render--table-padding-widths padding alignment)))
+    (concat (md-render--table-widget-pixel-space (car widths))
+            text
+            (md-render--table-widget-pixel-space (cdr widths)))))
+
+(cl-defun md-render--table-widget-row
+    (&key cells widths alignments row-face boundary-pixels window)
+  "Render CELLS at pixel WIDTHS with ALIGNMENTS and ROW-FACE in WINDOW.
+BOUNDARY-PIXELS is the uniform advance of every vertical border."
+  (let* ((border (if md-render-table-use-unicode-borders "│" "|"))
+         (styled-border (md-render--table-widget-boundary
+                         border boundary-pixels window))
+         (space-pixels (md-render--table-char-pixel-width window))
+         (content-widths (mapcar (lambda (width)
+                                   (max 1 (- width (* 2 space-pixels))))
+                                 widths))
+         (wrapped (seq-mapn
+                   (lambda (cell width)
+                     (md-render--table-widget-wrap-pixels cell width window))
+                   cells content-widths))
+         (height (apply #'max 1 (mapcar #'length wrapped)))
+         lines)
+    (dotimes (line-index height)
+      (let (parts)
+        (seq-mapn
+         (lambda (cell-lines content-width alignment)
+           (let* ((line (or (nth line-index cell-lines) ""))
+                  (content (md-render--table-widget-pad
+                            :text line :pixels content-width
+                            :window window :alignment alignment))
+                  (cell (concat " " content " ")))
+             (when row-face
+               (add-face-text-property 0 (length cell) row-face t cell))
+             (when (zerop line-index)
+               (let ((start 0))
+                 (while (and (< start (length cell))
+                             (or (eq (seq-elt cell start) ?\s)
+                                 (get-text-property
+                                  start 'md-render-table-synthetic-spacing
+                                  cell)))
+                   (setq start (1+ start)))
+                 (if (< start (length cell))
+                     (put-text-property start (1+ start)
+                                        'md-render-table-cell-start t cell)
+                   ;; An empty logical cell still needs a concrete cursor
+                   ;; target.  Its leading literal padding is stable and is
+                   ;; preferable to a synthetic display-space anchor.
+                   (put-text-property 0 1
+                                      'md-render-table-cell-start t cell))))
+             (push cell parts)))
+         wrapped content-widths alignments)
+        (push (concat styled-border
+                      (string-join (nreverse parts) styled-border)
+                      styled-border)
+              lines)))
+    (string-join (nreverse lines) "\n")))
+
+(defconst md-render--table-widget-width-cap-fraction 0.5
+  "Fraction of the available width that bounds one column's claims.
+
+Two claims are capped: the minimum a column demands for its
+longest unbreakable token, and the natural width that weights the
+share of the flexible space.  Without the cap a single huge cell
+(one 1200-character paragraph) takes nearly the whole table and
+starves the short columns down to one character per line.")
+
+(defun md-render--table-widget-longest-token-pixels (text window)
+  "Return the pixel width of the widest unbreakable token in TEXT.
+Tokens end at whitespace and after any character the wrapper may
+break after (see `md-render--table-break-after-p'), so the result
+is the narrowest width at which `md-render--table-widget-wrap-pixels'
+never has to split a word."
+  (let ((length (length text))
+        (start 0)
+        (widest 0))
+    (cl-flet ((measure-token (end)
+                (when (> end start)
+                  (setq widest
+                        (max widest
+                             (md-render--table-measure-string
+                              (substring text start end) window))))))
+      (dotimes (index length)
+        (cond
+         ((memq (seq-elt text index) '(?\s ?\t))
+          (measure-token index)
+          (setq start (1+ index)))
+         ((and (< index (1- length))
+               (md-render--table-break-after-p text index))
+          (measure-token (1+ index))
+          (setq start (1+ index)))))
+      (measure-token length))
+    widest))
+
+(defun md-render--table-widget-widths
+    (processed-rows columns pixel-budget boundary-pixels window)
+  "Allocate widths for PROCESSED-ROWS and COLUMNS in WINDOW.
+PIXEL-BUDGET includes the BOUNDARY-PIXELS between columns.
+
+Each column claims a minimum (its widest grapheme, or its widest
+unbreakable token up to the cap) and a natural width (its widest
+cell).  When the natural widths do not fit, the flexible space
+left after the minimums is shared in proportion to each column's
+natural width above its minimum, with the natural width capped by
+`md-render--table-widget-width-cap-fraction' so that one giant cell
+cannot starve the other columns."
+  (let* ((space-pixels (md-render--table-char-pixel-width window))
+         (base-minimum (+ 1 (* 2 space-pixels)))
+         (available (- pixel-budget (* (1+ columns) boundary-pixels)))
+         (cap (floor (* md-render--table-widget-width-cap-fraction
+                        available)))
+         (minimums (make-list columns base-minimum))
+         (natural (make-list columns base-minimum)))
+    (dolist (entry processed-rows)
+      (cl-loop for cell in (cdr entry)
+               for column from 0
+               do (let ((cell-pixels
+                         (md-render--table-measure-string cell window))
+                        (cluster-maximum 1)
+                        (token-maximum
+                         (md-render--table-widget-longest-token-pixels
+                          cell window)))
+                    (let ((start 0))
+                      (dolist (end (md-render--table-widget-grapheme-ends
+                                    cell 0))
+                        (setq cluster-maximum
+                              (max cluster-maximum
+                                   (md-render--table-measure-string
+                                    (substring cell start end) window)))
+                        (setq start end)))
+                    (setf (nth column natural)
+                          (max (nth column natural)
+                               (+ (* 2 space-pixels) cell-pixels)))
+                    (setf (nth column minimums)
+                          (max (nth column minimums)
+                               (+ (* 2 space-pixels)
+                                  (max cluster-maximum
+                                       (min token-maximum cap))))))))
+    (let ((natural-total (apply #'+ natural))
+          (minimum-total (apply #'+ minimums)))
+      (cond
+       ((not md-render-table-wrap-columns) natural)
+       ((<= natural-total available) natural)
+       ((<= available minimum-total) minimums)
+       (t
+        (let* ((flexible (- available minimum-total))
+               (weights (seq-mapn (lambda (width minimum)
+                                    (max 1 (- (min width cap) minimum)))
+                                  natural minimums))
+               (weight-total (apply #'+ weights))
+               (allocated 0)
+               widths)
+          (cl-loop for weight in weights
+                   for minimum in minimums
+                   for column from 0
+                   for column-width =
+                   (if (= column (1- columns))
+                       (- available allocated)
+                     (+ minimum
+                        (floor (* flexible (/ (float weight) weight-total)))))
+                   do (setq allocated (+ allocated column-width))
+                   do (push column-width widths))
+          (nreverse widths)))))))
+
+(defun md-render--table-widget-pixel-budget (width window)
+  "Return the pixel budget for a table laid out at WIDTH columns in WINDOW.
+
+WIDTH comes from `window-body-width', which counts columns of the
+frame's default font.  Converting it back with the `fixed-pitch'
+space width overshoots whenever `default' and `fixed-pitch' use
+fonts of different advance (an Iosevka frame whose `fixed-pitch'
+falls back to Courier is 14% too wide), and likewise under
+`text-scale-mode'.  So when WIDTH fills WINDOW, never exceed the
+window's real body pixel width.  The clamp is skipped when the
+window reports pixels no larger than its column count (batch
+frames and mocked windows), where the measurement is the only
+meaningful unit."
+  (let ((measured (md-render--table-measure-string
+                   (make-string width ?\s) window))
+        (body-pixels (and (window-live-p window)
+                          (window-body-width window t))))
+    (if (and body-pixels
+             (> body-pixels width)
+             (>= width (window-body-width window)))
+        (min measured body-pixels)
+      measured)))
+
+(cl-defun md-render--render-table-widget-source (&key source window width)
+  "Render SOURCE as a pixel-accurate table widget in WINDOW at WIDTH columns."
+  (with-temp-buffer
+    (insert source)
+    (setq-local inhibit-field-text-motion t)
+    (let* ((rows (md-render--collect-table-rows))
+           (separator-row-num (md-render--find-separator-row-num rows))
+           (preprocessed (md-render--preprocess-table
+                          :rows rows :separator-row-num separator-row-num
+                          :window window))
+           (processed-rows (map-elt preprocessed :processed-rows))
+           (alignments (map-elt preprocessed :alignments))
+           (columns (length alignments))
+           (pixel-budget (md-render--table-widget-pixel-budget width window))
+           (boundary-pixels (md-render--table-widget-boundary-pixels window))
+           (widths (md-render--table-widget-widths
+                    processed-rows columns pixel-budget boundary-pixels
+                    window))
+           (top (if md-render-table-use-unicode-borders
+                    '("┌" "┬" "┐") '("+" "+" "+")))
+           (middle (if md-render-table-use-unicode-borders
+                       '("├" "┼" "┤") '("|" "|" "|")))
+           (bottom (if md-render-table-use-unicode-borders
+                       '("└" "┴" "┘") '("+" "+" "+")))
+           (data-row-num 0)
+           (parts (list (apply #'md-render--table-widget-rule
+                               (append (list widths) top
+                                       (list boundary-pixels window))))))
+      (dolist (entry processed-rows)
+        (let* ((row (car entry))
+               (cells (cdr entry))
+               (separator (map-elt row :separator))
+               (row-face (md-render--table-row-face
+                          row separator-row-num data-row-num)))
+          (if separator
+              (push (apply #'md-render--table-widget-rule
+                           (append (list widths) middle
+                                   (list boundary-pixels window))) parts)
+            (push (md-render--table-widget-row
+                   :cells cells :widths widths :alignments alignments
+                   :row-face row-face :boundary-pixels boundary-pixels
+                   :window window)
+                  parts)
+            (unless (and separator-row-num
+                         (< (map-elt row :num) separator-row-num))
+              (setq data-row-num (1+ data-row-num))))))
+      (push (apply #'md-render--table-widget-rule
+                   (append (list widths) bottom
+                           (list boundary-pixels window))) parts)
+      (let ((rendered (string-join (nreverse parts) "\n")))
+        (add-face-text-property 0 (length rendered) 'fixed-pitch nil rendered)
+        rendered))))
+
+(cl-defun md-render--render-table-source (&key source window framed)
   "Render SOURCE (markdown table text) to a propertized string.
 
 SOURCE may carry text properties from earlier passes (bold faces
@@ -3283,7 +3717,10 @@ WINDOW, when given, is the destination window used for pixel-
 accurate width measurement of non-ASCII cell content (emoji,
 CJK) so right borders align across rows.  Without it,
 measurement falls back to `string-width' — fine for ASCII but
-prone to a few-pixel drift on emoji-heavy tables."
+prone to a few-pixel drift on emoji-heavy tables.
+
+When FRAMED is non-nil, add the complete outer border used by
+the block-widget presentation."
   (with-temp-buffer
     (insert source)
     ;; SOURCE inherits `field' text properties from the calling buffer
@@ -3341,7 +3778,24 @@ prone to a few-pixel drift on emoji-heavy tables."
                    :row-face row-face
                    :window window))
                 rendered-rows)))
-      (string-join (nreverse rendered-rows) "\n"))))
+      (let ((body (nreverse rendered-rows)))
+        (when framed
+          (setq body
+                (append
+                 (list
+                  (if md-render-table-use-unicode-borders
+                      (md-render--render-table-rule
+                       col-widths "┌" "┬" "┐")
+                    (md-render--render-table-rule
+                     col-widths "+" "+" "+")))
+                 body
+                 (list
+                  (if md-render-table-use-unicode-borders
+                      (md-render--render-table-rule
+                       col-widths "└" "┴" "┘")
+                    (md-render--render-table-rule
+                     col-widths "+" "+" "+"))))))
+        (string-join body "\n")))))
 
 (defun md-render--collect-table-rows ()
   "Collect table rows in current buffer (typically a temp buffer).
