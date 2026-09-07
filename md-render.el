@@ -71,6 +71,7 @@
 (require 'url)
 (require 'url-parse)
 (require 'url-util)
+(require 'wid-edit)
 
 (defgroup md-render nil
   "Render Markdown text into propertized form."
@@ -256,6 +257,30 @@ edge and the view follows the cursor as it moves right
   "When non-nil, alternate row backgrounds in tables for readability."
   :type 'boolean
   :group 'md-render)
+
+(defun md-render--table-widget-layout (widget width)
+  "Lay out table WIDGET within WIDTH columns."
+  (let ((md-render-table-max-width-fraction 1.0)
+        (source (widget-get widget :value))
+        (window (or (get-buffer-window (current-buffer))
+                    (selected-window))))
+    (cl-letf (((symbol-function 'md-render--display-width)
+               (lambda () width)))
+      (md-render--render-table-source :source source :window window))))
+
+(defun md-render--table-widget-attach (widget from to)
+  "Attach table WIDGET to the rendered text from FROM to TO."
+  (widget-put widget :from (copy-marker from t))
+  (widget-put widget :to (copy-marker to nil))
+  (widget-put widget :delete #'widget-leave-text)
+  (widget-put widget :textui-attached t))
+
+(define-widget 'md-render-table-widget 'default
+  "A width-aware rendered Markdown table."
+  :format "%v"
+  :keymap widget-keymap
+  :textui-layout #'md-render--table-widget-layout
+  :textui-attach #'md-render--table-widget-attach)
 
 (defcustom md-render-math-enabled t
   "When non-nil, render LaTeX math as SVG when local tools are available.
@@ -2345,6 +2370,10 @@ skipped."
           (setq pos (point))))))
     (nreverse tables)))
 
+(defun md-render-tables-present-p ()
+  "Return non-nil when the current buffer contains a Markdown table."
+  (and (md-render--find-tables) t))
+
 (defun md-render--parse-table-row (start end)
   "Parse table row from START to END into cells.
 
@@ -3006,19 +3035,26 @@ containing emoji/CJK line up with the column's right border."
   (let ((data-row-num 0)
         (alignments nil)
         (widths nil)
-        (processed-rows nil))
+        (processed-rows nil)
+        (column-count
+         (when-let* ((header (car rows)))
+           (length (md-render--parse-table-row
+                    (map-elt header :start) (map-elt header :end))))))
     (dolist (row rows)
       (if (map-elt row :separator)
           (let ((cells (md-render--parse-table-row
                         (map-elt row :start) (map-elt row :end))))
             (setq alignments
-                  (mapcar (lambda (cell)
-                            (md-render--table-alignment
-                             (map-elt cell :content)))
-                          cells))
+                  (mapcar
+                   (lambda (cell)
+                     (md-render--table-alignment
+                      (map-elt cell :content)))
+                   (seq-take cells column-count)))
             (push (cons row nil) processed-rows))
-        (let ((cells (md-render--parse-table-row
-                      (map-elt row :start) (map-elt row :end)))
+        (let ((cells (seq-take
+                      (md-render--parse-table-row
+                       (map-elt row :start) (map-elt row :end))
+                      column-count))
               (col 0)
               (processed-cells nil)
               (row-face (md-render--table-row-face
@@ -3036,7 +3072,13 @@ containing emoji/CJK line up with the column's right border."
                     (setf (nth col widths) (max (nth col widths) dw))
                   (setq widths (append widths (list dw))))
                 (setq col (1+ col)))))
-          (push (cons row (nreverse processed-cells)) processed-rows)
+          (setq processed-cells (nreverse processed-cells))
+          (setq processed-cells
+                (append processed-cells
+                        (make-list (- column-count
+                                      (length processed-cells))
+                                   "")))
+          (push (cons row processed-cells) processed-rows)
           (unless (and separator-row-num
                        (< (map-elt row :num) separator-row-num))
             (setq data-row-num (1+ data-row-num))))))

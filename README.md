@@ -26,10 +26,10 @@ It provides two views of the same buffer:
 - **Styled while editable.** Heading scale, emphasis, code, links, quotes,
   callouts, and table decoration are visible without leaving the source
   buffer.
-- **Tables that remain Markdown.** Tables auto-align, display with box-drawing
-  borders, stay scrollable when wider than the window, and can be created or
-  deleted as complete structures. The file still contains normal pipe-table
-  syntax.
+- **Tables that remain Markdown.** Edit view displays the original pipe-table
+  syntax without rewriting it on open. Tables stay scrollable when wider than
+  the window and can be aligned explicitly, created, or deleted as complete
+  structures.
 - **Structure beside the document.** A live TOC shows ATX headings in a side
   window and jumps through the same marker-backed index used by Imenu.
 - **Org-like structural editing.** Fold sections, navigate headings, promote
@@ -54,7 +54,7 @@ package ecosystem.
 | Primary goal     | A styled, Org-like Markdown workspace                                            | Broad Markdown editing and tooling                                                               |
 | Editable display | Live styling is the default experience                                           | Syntax-oriented by default; markup hiding and heading scaling are optional                       |
 | Complete preview | Read-only rendering in the same buffer, built in                                 | HTML preview and export through a configured Markdown processor                                  |
-| Tables           | Created, deleted, auto-aligned, box-drawn, width-aware, and structurally editable | Part of a wider, more configurable editing environment                                           |
+| Tables           | Raw while editing; rendered responsively; structurally editable                  | Part of a wider, more configurable editing environment                                           |
 | Workflow         | Compact Org-style key set with a built-in per-buffer TOC                          | Extensive command set covering more Markdown conventions                                         |
 | Scope            | Common Markdown/GFM authoring, currently focused on .md files and ATX headings | Multiple filename conventions, markdown-mode, gfm-mode, extensions, export, and integrations |
 
@@ -68,6 +68,9 @@ integrations, or long-term compatibility are more important.
 ## Requirements
 
 - Emacs 29.1 or newer
+- [TextUI](https://github.com/yibie/textui) with standalone block-widget
+  support, used when rendered view contains Markdown tables. Editable tables
+  and rendered documents without tables do not load it.
 
 Optional Rendered-view integrations:
 
@@ -193,6 +196,18 @@ In the rendered view (`C-c C-v`), wide tables wrap to the window
 width instead, with long cells spread over several lines.  Set
 `md-render-table-wrap-columns` to `nil` to render them at natural
 width and scroll with the cursor, as in the edit view.
+
+Rendered tables are laid out when rendered, when the window width changes,
+and after text scaling; ordinary scrolling does not relayout them.  Layout
+cost grows roughly linearly with table size.  In a four-column mixed CJK/ASCII
+benchmark, a 100-row table took about 43 ms to render and 46 ms to relayout;
+300 rows took about 90–95 ms, and 1,000 rows about 290 ms.  Large tables remain
+cheap to restore to source (about 2 ms at 1,000 rows), but continuously
+resizing a window containing several hundred rows may produce a visible
+pause.  When the same buffer is visible in windows of different widths,
+automatic relayout is skipped because one text buffer cannot hold two
+different physical layouts simultaneously.
+
 Other long rendered lines remain horizontally scrollable by default.
 Set `md-render-wrap-lines` to `t` to wrap them at the window edge;
 list-item continuations align with their content and heading
@@ -223,7 +238,7 @@ Editing and structure:
 
 | Option | Default | Purpose |
 |--------|---------|---------|
-| `md-mode-auto-align-tables` | `t` | Align Markdown tables when entering `md-mode` |
+| `md-mode-auto-align-tables` | `nil` | Align Markdown tables when entering `md-mode` when explicitly enabled |
 | `md-mode-clip-wide-tables` | `nil` | Leave wide table rows overflowing the window edge and scrollable; `t` clips them at the edge with fringe dots |
 | `md-mode-fold-front-matter-on-open` | `nil` | Start with front matter folded |
 | `md-mode-use-markdown-mode-faces` | `t` | Reuse compatible faces when `markdown-mode` faces are already loaded |
@@ -265,11 +280,11 @@ Advanced renderer integration:
 | `md-render-language-mapping` | Common language aliases | Map fenced-block language names to Emacs major modes |
 | `md-render-render-functions` | `(md-render--render-media)` | Register renderers that claim and freeze regions before styling |
 
-Tables align automatically when `md-mode` starts. Disable that behavior
-without changing table rendering:
+Tables retain their original spacing when `md-mode` starts. Enable automatic
+source alignment explicitly if desired:
 
 ```elisp
-(setq md-mode-auto-align-tables nil)
+(setq md-mode-auto-align-tables t)
 ```
 
 The TOC opens on the left at 30 columns. Change either default without

@@ -5,7 +5,7 @@
 ;; Author: LuciusChen
 ;; Assisted-by: Codex:gpt-5.5
 ;; URL: https://github.com/yibie/md-mode
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: wp, convenience
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -43,6 +43,9 @@
 (require 'subr-x)
 (require 'text-property-search)
 
+(declare-function textui-attach-widget "textui" (widget from to))
+(declare-function textui-layout-widget "textui" (widget width))
+
 (defgroup md nil
   "Edit and render Markdown buffers."
   :group 'text)
@@ -50,7 +53,13 @@
 (defvar-local md-mode--rendered-p nil
   "Non-nil when the current buffer displays rendered Markdown.")
 
-(defcustom md-mode-auto-align-tables t
+(defvar-local md-mode--table-widgets nil
+  "Table widgets attached to the current rendered Markdown view.")
+
+(defvar-local md-mode--table-widget-width nil
+  "Width used for table widgets in the current rendered view.")
+
+(defcustom md-mode-auto-align-tables nil
   "When non-nil, align Markdown tables when entering `md-mode'."
   :type 'boolean
   :group 'md)
@@ -1573,81 +1582,6 @@ When the region is active, use its lines as the callout body."
           (setq matched t))))
     matched))
 
-(defun md-mode--table-marker-display (position end)
-  "Return box-drawing display for table marker from POSITION to END."
-  (if (eq (char-after position) ?-)
-      (propertize
-       (make-string (- end position) ?\s)
-       'face '(md-render-table-border fixed-pitch (:strike-through t)))
-    (if (not (md-mode--table-separator-line-p))
-        "│"
-      (let ((line-begin (line-beginning-position))
-            (line-end (line-end-position)))
-        (cond
-         ((save-excursion
-            (goto-char position)
-            (skip-chars-backward " \t" line-begin)
-            (= (point) line-begin))
-          "├")
-         ((save-excursion
-            (goto-char (1+ position))
-            (skip-chars-forward " \t" line-end)
-            (= (point) line-end))
-          "┤")
-         (t "┼"))))))
-
-(defun md-mode--match-table-marker (limit)
-  "Find and display a Markdown table marker before LIMIT."
-  (let (matched)
-    (while (and (not matched)
-                (re-search-forward "|\\|-+" limit t))
-      (let ((begin (match-beginning 0))
-            (end (match-end 0)))
-        (when (and (md-mode--table-line-p)
-                   (or (eq (char-after begin) ?|)
-                       (md-mode--table-separator-line-p))
-                   (or (not (eq (char-after begin) ?|))
-                       (not (md-mode--escaped-p begin))))
-          (with-silent-modifications
-            (put-text-property
-             begin end 'display
-             (md-mode--table-marker-display begin end)))
-          (set-match-data (list begin end))
-          (setq matched t))))
-    matched))
-
-(defun md-mode--match-table-padding (limit)
-  "Find table padding before LIMIT and align its following pipe."
-  (let (matched)
-    (while (and (not matched)
-                (re-search-forward "[ \t]+|" limit t))
-      (let ((begin (match-beginning 0))
-            (pipe (1- (match-end 0))))
-        (when (and (md-mode--table-line-p)
-                   (not (md-mode--table-separator-line-p))
-                   (not (md-mode--escaped-p pipe)))
-          (when (and (display-graphic-p)
-                     (fboundp 'string-pixel-width))
-            (let* ((line-begin (line-beginning-position))
-                   (columns
-                    (string-width
-                     (buffer-substring-no-properties line-begin pipe)))
-                   (target (* columns
-                              (string-pixel-width
-                               (propertize " " 'face 'fixed-pitch))))
-                   (content
-                    (string-pixel-width
-                     (buffer-substring line-begin begin)))
-                   (padding (- target content)))
-              (when (> padding 0)
-                (with-silent-modifications
-                  (put-text-property
-                   begin pipe 'display
-                   `(space :width (,padding)))))))
-          (set-match-data (list begin pipe))
-          (setq matched t))))
-    matched))
-
 ;; Adapted from lte.el's window-local overlay model:
 ;; https://github.com/fredericgiquel/lte.el
 (defun md-mode--visual-line-end-position ()
@@ -1851,11 +1785,8 @@ Applies to both the edit and the rendered view."
      (1 'md-render-blockquote))
     (md-mode--match-table-header
      (0 'md-render-table-header prepend))
-    (md-mode--match-table-marker
-     (0 'md-render-table-border prepend))
     (md-mode--match-table-row
-     (0 'fixed-pitch prepend))
-    md-mode--match-table-padding)
+     (0 'fixed-pitch prepend)))
   "Font-lock rules for editable Markdown source.")
 
 (defun md-mode--ensure-mode ()
@@ -2391,12 +2322,114 @@ Applies to both the edit and the rendered view."
            (+ source-offset (- position run-start))
          0))))
 
+(defun md-mode--render-width ()
+  "Return the width available to rendered block widgets."
+  (let ((window (get-buffer-window (current-buffer))))
+    (if (window-live-p window)
+        (window-body-width window)
+      80)))
+
+(defun md-mode--clear-table-widgets ()
+  "Detach all table widgets from the current buffer."
+  (dolist (widget md-mode--table-widgets)
+    (widget-delete widget))
+  (setq md-mode--table-widgets nil
+        md-mode--table-widget-width nil))
+
+(defun md-mode--attach-table-widgets ()
+  "Replace rendered table strings with width-aware table widgets."
+  (md-mode--clear-table-widgets)
+  (let ((position (point-min))
+        (width (md-mode--render-width)))
+    (while (< position (point-max))
+      (let ((source (get-text-property position 'md-render-table-source)))
+        (if (not source)
+            (setq position
+                  (next-single-property-change
+                   position 'md-render-table-source nil (point-max)))
+          (let* ((end (next-single-property-change
+                       position 'md-render-table-source nil (point-max)))
+                 (widget (widget-convert
+                          'md-render-table-widget :value source))
+                 (rendered (textui-layout-widget widget width))
+                 (carried (md-render--carry-properties position)))
+            (delete-region position end)
+            (goto-char position)
+            (insert rendered)
+            (setq end (point))
+            (when carried
+              (add-text-properties position end carried))
+            (add-face-text-property position end 'fixed-pitch nil)
+            (add-text-properties
+             position end
+             `(md-render-frozen t
+                                md-render-table-source ,source
+                                md-render-source ,source
+                                rear-nonsticky
+                                (md-render-frozen
+                                 md-render-table-source
+                                 md-render-source)))
+            (textui-attach-widget widget position end)
+            (push widget md-mode--table-widgets)
+            (setq position end)))))
+    (setq md-mode--table-widget-width width)))
+
+(defun md-mode--refresh-table-widget-layout (&optional force)
+  "Relayout table widgets when all visible windows have one width.
+When FORCE is non-nil, relayout even when the character width is unchanged."
+  (when (and md-mode--rendered-p md-mode--table-widgets)
+    (let* ((windows (get-buffer-window-list (current-buffer) nil t))
+           (widths (delete-dups (mapcar #'window-body-width windows))))
+      (when (and (= (length widths) 1)
+                 (or force
+                     (not (equal (car widths)
+                                 md-mode--table-widget-width))))
+        (let ((modified (buffer-modified-p))
+              (buffer-undo-list t)
+              (inhibit-read-only t)
+              (width (car widths)))
+          (save-excursion
+            (with-silent-modifications
+              (dolist (widget md-mode--table-widgets)
+                (let* ((from (marker-position (widget-get widget :from)))
+                       (to (marker-position (widget-get widget :to)))
+                       (source (widget-get widget :value))
+                       (carried (md-render--carry-properties from))
+                       (rendered (textui-layout-widget widget width)))
+                  (widget-delete widget)
+                  (delete-region from to)
+                  (goto-char from)
+                  (insert rendered)
+                  (setq to (point))
+                  (when carried
+                    (add-text-properties from to carried))
+                  (add-face-text-property from to 'fixed-pitch nil)
+                  (add-text-properties
+                   from to
+                   `(md-render-frozen t
+                                      md-render-table-source ,source
+                                      md-render-source ,source
+                                      rear-nonsticky
+                                      (md-render-frozen
+                                       md-render-table-source
+                                       md-render-source)))
+                  (textui-attach-widget widget from to)))
+              (setq md-mode--table-widget-width width)))
+          (set-buffer-modified-p modified))))))
+
+(defun md-mode--refresh-table-widget-layout-after-scale ()
+  "Relayout rendered table widgets after a text-scale change."
+  (md-mode--refresh-table-widget-layout t))
+
 ;;;###autoload
 (defun md-mode-render ()
   "Render Markdown in the current buffer and make it read-only."
   (interactive)
   (md-mode--ensure-mode)
   (unless md-mode--rendered-p
+    (when (and (md-render-tables-present-p)
+               (not (require 'textui nil t)))
+      (user-error "Rendered table widgets require TextUI"))
     (outline-show-all)
     (let ((modified (buffer-modified-p))
           (buffer-undo-list t)
@@ -2413,7 +2446,8 @@ Applies to both the edit and the rendered view."
         (when font-lock-mode
           (font-lock-ensure))
         (with-silent-modifications
-          (md-render-replace-markup :force t)))
+          (md-render-replace-markup :force t)
+          (md-mode--attach-table-widgets)))
       (md-mode--set-rendered-p t)
       (md-mode--scale-heading-fallback-font)
       (set-buffer-modified-p modified)
@@ -2438,6 +2472,7 @@ Applies to both the edit and the rendered view."
         (widen)
         (setq source-point (md-mode--source-position-at-point))
         (with-silent-modifications
+          (md-mode--clear-table-widgets)
           (let ((source (md-render-reconstruct (point-min) (point-max))))
             (erase-buffer)
             (insert source))))
@@ -2535,8 +2570,12 @@ Applies to both the edit and the rendered view."
   (add-hook 'kill-buffer-hook #'md-mode--toc-cleanup nil t)
   (add-hook 'window-configuration-change-hook
             #'md-mode--truncate-tables-in-buffer nil t)
+  (add-hook 'window-configuration-change-hook
+            #'md-mode--refresh-table-widget-layout nil t)
   (add-hook 'text-scale-mode-hook
             #'md-mode--truncate-tables-in-buffer nil t)
+  (add-hook 'text-scale-mode-hook
+            #'md-mode--refresh-table-widget-layout-after-scale nil t)
   (add-hook 'visual-line-mode-hook
             #'md-mode--apply-rendered-wrapping nil t)
   (jit-lock-register #'md-mode--truncate-tables-in-region)

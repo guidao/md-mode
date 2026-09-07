@@ -907,7 +907,7 @@
         (should-not (get-text-property first-fence 'syntax-table))
         (should (get-text-property start 'syntax-table))))))
 
-(ert-deftest md-mode-styles-and-aligns-tables ()
+(ert-deftest md-mode-styles-tables-without-replacing-source-display ()
   (with-temp-buffer
     (let ((md-mode-auto-align-tables nil)
           (source
@@ -919,17 +919,9 @@
     (should (md-mode-tests--has-face-p "Name" 'md-render-table-header))
     (search-backward "Name")
     (should (eq (car (get-text-property (point) 'face)) 'fixed-pitch))
-    (should (md-mode-tests--has-face-p "---" 'md-render-table-border))
     (goto-char (point-min))
-    (should (equal (get-text-property (point) 'display) "│"))
-    (forward-line 1)
-    (should (equal (get-text-property (point) 'display) "├"))
-    (search-forward "-")
-    (should (string-match-p
-             "\\` +\\'"
-             (get-text-property (1- (point)) 'display)))
-    (search-forward "|")
-    (should (equal (get-text-property (1- (point)) 'display) "┼"))
+    (should-not (text-property-not-all
+                 (point-min) (point-max) 'display nil))
     (search-forward "prose |")
     (should-not (get-text-property (1- (point)) 'display))
     (md-mode-tests--face-at "Name")
@@ -938,8 +930,8 @@
     (should-not (string-match-p "+" (buffer-string)))
     (should (string-match-p "| A +| Longer +|" (buffer-string)))
     (font-lock-ensure)
-    (goto-char (point-min))
-    (should (equal (get-text-property (point) 'display) "│"))))
+    (should-not (text-property-not-all
+                 (point-min) (point-max) 'display nil))))
 
 (ert-deftest md-mode-clip-wide-tables-option ()
   ;; Wide rows are scrollable by default in both views: `truncate-lines'
@@ -1099,23 +1091,6 @@
       (should (equal (get-text-property (point) 'wrap-prefix) "  "))
       (forward-line 1)
       (should (equal (get-text-property (point) 'wrap-prefix) "    ")))))
-
-(ert-deftest md-mode-aligns-table-padding-by-pixel-width ()
-  (with-temp-buffer
-    (let ((md-mode-auto-align-tables nil))
-      (insert "| Name | Value |\n|---|---|\n| A | B |\n")
-      (md-mode)
-      (font-lock-ensure))
-    (goto-char (point-min))
-    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
-              ((symbol-function 'string-pixel-width)
-               (lambda (string)
-                 (if (equal (substring-no-properties string) " ")
-                     10
-                   20))))
-      (should (md-mode--match-table-padding (point-max)))
-      (should (equal (get-text-property (match-beginning 0) 'display)
-                     '(space :width (50)))))))
 
 (ert-deftest md-mode-creates-standard-table ()
   (with-temp-buffer
@@ -1311,7 +1286,7 @@
     (search-forward "\\|")
     (should-not (get-text-property (1- (point)) 'display))))
 
-(ert-deftest md-mode-table-separator-display-preserves-width ()
+(ert-deftest md-mode-table-separator-remains-raw-markdown ()
   (with-temp-buffer
     (insert "| Name | Width | Key Changes |\n|---|---|---|\n| Max | 1584px | Carbon max grid |\n")
     (md-mode)
@@ -1319,10 +1294,8 @@
     (goto-char (point-min))
     (forward-line 1)
     (re-search-forward "-+")
-    (let ((source-width (- (match-end 0) (match-beginning 0)))
-          (display (get-text-property (match-beginning 0) 'display)))
-      (should (= (string-width display) source-width))
-      (should (string-match-p "\\` +\\'" display)))))
+    (should (equal (match-string-no-properties 0) "---"))
+    (should-not (get-text-property (match-beginning 0) 'display))))
 
 (ert-deftest md-mode-truncates-wide-table-without-changing-source ()
   ;; With `md-mode-clip-wide-tables' enabled, wide rows get a
@@ -1357,11 +1330,25 @@
                   (should (equal (buffer-string) source))))))
         (kill-buffer buffer)))))
 
-(ert-deftest md-mode-auto-aligns-tables-on-open ()
+(ert-deftest md-mode-preserves-unaligned-tables-on-open-by-default ()
+  (with-temp-buffer
+    (let ((source
+           "| Level | Treatment | Use |\n|---|---|---|\n| 0 | No shadow | Default |\n"))
+      (insert source)
+      (set-buffer-modified-p nil)
+      (md-mode)
+      (font-lock-ensure)
+      (should-not (buffer-modified-p))
+      (should (equal (buffer-string) source))
+      (should-not (text-property-not-all
+                   (point-min) (point-max) 'display nil)))))
+
+(ert-deftest md-mode-auto-aligns-tables-on-open-when-enabled ()
   (with-temp-buffer
     (insert "| Level | Treatment | Use |\n|---|---|---|\n| 0 | No shadow | Default |\n")
     (set-buffer-modified-p nil)
-    (md-mode)
+    (let ((md-mode-auto-align-tables t))
+      (md-mode))
     (should-not (buffer-modified-p))
     (should
      (equal (buffer-string)
@@ -1394,6 +1381,89 @@
     (should-not buffer-read-only)
     (should-not (buffer-modified-p))
     (should (equal (buffer-string) md-mode-tests--source))))
+
+(ert-deftest md-mode-render-embeds-table-as-one-widget-with-body-text ()
+  (with-temp-buffer
+    (let ((source (concat "Before.\n\n"
+                          "| Name | Value |\n"
+                          "| --- | --- |\n"
+                          "| A | B |\n\n"
+                          "After.\n")))
+      (insert source)
+      (md-mode)
+      (md-mode-render)
+      (should (string-match-p "Before\\." (buffer-string)))
+      (should (string-match-p "After\\." (buffer-string)))
+      (should (= (length md-mode--table-widgets) 1))
+      (let* ((widget (car md-mode--table-widgets))
+             (from (widget-get widget :from))
+             (to (widget-get widget :to)))
+        (should (eq (widget-type widget) 'md-render-table-widget))
+        (should (eq (widget-get widget :keymap) widget-keymap))
+        (should (markerp from))
+        (should (markerp to))
+        (should (< from to))
+        (should (equal (get-text-property from 'md-render-source)
+                       (widget-get widget :value))))
+      (md-mode-show-source)
+      (should-not md-mode--table-widgets)
+      (should (equal (buffer-string) source)))))
+
+(ert-deftest md-mode-render-rebuilds-table-widget ()
+  (with-temp-buffer
+    (insert "| A | B |\n| --- | --- |\n| C | D |\n")
+    (md-mode)
+    (md-mode-render)
+    (let ((first (car md-mode--table-widgets)))
+      (md-mode-refresh-render)
+      (should (= (length md-mode--table-widgets) 1))
+      (should-not (eq first (car md-mode--table-widgets))))))
+
+(ert-deftest md-mode-resizes-table-widget-with-visible-window ()
+  (with-temp-buffer
+    (insert "| Heading | Detail |\n| --- | --- |\n"
+            "| A | A sufficiently long value to wrap at narrow widths |\n\n"
+            "After table.\n")
+    (md-mode)
+    (cl-letf (((symbol-function 'md-mode--render-width) (lambda () 60)))
+      (md-mode-render))
+    (let ((wide (buffer-string))
+          (widget (car md-mode--table-widgets)))
+      (goto-char (point-min))
+      (search-forward "After table.")
+      (goto-char (match-beginning 0))
+      (let ((point-text (thing-at-point 'line t)))
+        (cl-letf (((symbol-function 'get-buffer-window-list)
+                   (lambda (&rest _) (list (selected-window))))
+                  ((symbol-function 'window-body-width)
+                   (lambda (&rest _) 30)))
+          (md-mode--refresh-table-widget-layout))
+        (should (equal (thing-at-point 'line t) point-text)))
+      (should (= md-mode--table-widget-width 30))
+      (should (eq widget (car md-mode--table-widgets)))
+      (should-not (equal wide (buffer-string)))
+      (md-mode-show-source)
+      (should (equal (buffer-string)
+                     (concat "| Heading | Detail |\n| --- | --- |\n"
+                             "| A | A sufficiently long value to wrap at narrow widths |\n\n"
+                             "After table.\n"))))))
+
+(ert-deftest md-mode-text-scale-forces-table-widget-relayout ()
+  (with-temp-buffer
+    (insert "| A | B |\n| --- | --- |\n| C | D |\n")
+    (md-mode)
+    (cl-letf (((symbol-function 'md-mode--render-width) (lambda () 40)))
+      (md-mode-render))
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) (list (selected-window))))
+                ((symbol-function 'window-body-width) (lambda (&rest _) 40))
+                ((symbol-function 'textui-layout-widget)
+                 (lambda (widget width)
+                   (setq calls (1+ calls))
+                   (md-render--table-widget-layout widget width))))
+        (md-mode--refresh-table-widget-layout-after-scale))
+      (should (= calls 1)))))
 
 (ert-deftest md-mode-show-source-keeps-current-rendered-position ()
   (with-temp-buffer

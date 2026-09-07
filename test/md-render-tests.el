@@ -126,6 +126,13 @@
                   (md-render-convert ""))
                  '())))
 
+(ert-deftest md-render-convert-keeps-legacy-table-string-rendering ()
+  (let ((rendered (md-render-convert
+                   "| Name | Value |\n| --- | --- |\n| A | B |\n")))
+    (should (string-match-p "│ Name │ Value │" rendered))
+    (should (equal (get-text-property 0 'md-render-table-source rendered)
+                   "| Name | Value |\n| --- | --- |\n| A | B |"))))
+
 (ert-deftest md-render-convert-inline-code-protects-markup ()
   (should (equal (md-render--deconstruct
                   (md-render-convert
@@ -825,6 +832,14 @@ after" nil)))))
          (md-render-convert
           "| A | B |\n|:---:|---:|\n| long words here | right side |"))
         "│   A   │     B │\n├───────┼───────┤\n│ long  │ right │\n│ words │  side │\n│ here  │       │")))))
+
+(ert-deftest md-render-table-normalizes-body-cell-count-to-header ()
+  (should
+   (equal
+    (substring-no-properties
+     (md-render-convert
+      "| A | B |\n|---|---|\n| x | y | ignored |\n| m |"))
+    "│ A │ B │\n├───┼───┤\n│ x │ y │\n│ m │   │")))
 
 (ert-deftest md-render-convert-table-output-with-bold ()
   ;; Bold markup inside cells is stripped by the main pipeline before
