@@ -2274,6 +2274,18 @@ for a fully-selected buffer."
                   (md-render--media-cache-file backend "source")))
           (setq dark nil))))))
 
+(ert-deftest md-render-theme-colors-reject-unspecified-face-values ()
+  (cl-letf (((symbol-function 'face-foreground)
+             (lambda (&rest _) "unspecified-fg"))
+            ((symbol-function 'md-render--dark-background-p)
+             (lambda () nil)))
+    (should (equal (md-render--theme-foreground) "#000000")))
+  (cl-letf (((symbol-function 'face-background)
+             (lambda (&rest _) "unspecified-bg"))
+            ((symbol-function 'frame-parameter)
+             (lambda (&rest _) 'dark)))
+    (should (md-render--dark-background-p))))
+
 (ert-deftest md-render-plantuml-source-follows-theme-background ()
   (let ((source "@startuml\nEdit -> Render: local SVG\n@enduml\n"))
     (cl-letf (((symbol-function 'md-render--dark-background-p)

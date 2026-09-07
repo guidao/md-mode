@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 Alvaro Ramirez
 
-;; Author: Alvaro Ramirez https://xenodium.com
+;; Author: Alvaro Ramirez <https://xenodium.com>
 ;; Source: https://github.com/xenodium/agent-shell/blob/main/agent-shell-markdown.el
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -182,10 +182,10 @@
 (defconst md-render--list-prefix-regexp
   (rx bol
       (group
-       (zero-or-more (any " 	"))
-       (or (seq (any "-+*") (one-or-more blank))
+       (zero-or-more (char " 	"))
+       (or (seq (char "-+*") (one-or-more blank))
            (seq (one-or-more digit)
-                (any ".)")
+                (char ".)")
                 (one-or-more blank)))))
   "Regexp matching the visible prefix of a rendered list item.")
 
@@ -681,7 +681,8 @@ this returns `(((:watermark . 1200)))'."
   "Return non-nil when the current default face has a dark background."
   (if-let* ((background (face-background 'default nil t))
             ((stringp background))
-            (rgb (ignore-errors (color-name-to-rgb background))))
+            ((color-defined-p background))
+            (rgb (color-name-to-rgb background)))
       (color-dark-p rgb)
     (eq (frame-parameter nil 'background-mode) 'dark)))
 
@@ -689,7 +690,8 @@ this returns `(((:watermark . 1200)))'."
   "Return the current default foreground as a renderer-safe color."
   (let ((foreground (face-foreground 'default nil t)))
     (if (and (stringp foreground)
-             (ignore-errors (color-name-to-rgb foreground)))
+             (color-defined-p foreground)
+             (color-name-to-rgb foreground))
         foreground
       (if (md-render--dark-background-p) "#ffffff" "#000000"))))
 
@@ -1103,7 +1105,8 @@ and whose cdr is the earliest incomplete non-currency opener."
             (let (end)
               (save-excursion
                 (while (and (not end)
-                            (search-forward "$" (line-end-position) t))
+                            (search-forward
+                             "$" (save-excursion (end-of-line) (point)) t))
                   (let ((candidate (1- (point))))
                     (when (and
                            (md-render--single-dollar-close-p candidate)
@@ -1238,8 +1241,8 @@ world.\" with face `md-render-bold' on \"world\"."
     (while (re-search-forward
             (rx (or line-start (syntax whitespace))
                 (group
-                 (or (seq "**" (group (one-or-more (not (any "\n*")))) "**")
-                     (seq "__" (group (one-or-more (not (any "\n_")))) "__")))
+                 (or (seq "**" (group (one-or-more (not (char "\n*")))) "**")
+                     (seq "__" (group (one-or-more (not (char "\n_")))) "__")))
                 (or (syntax punctuation) (syntax whitespace) line-end))
             nil t)
       (let* ((markup-start (match-beginning 1))
@@ -1284,10 +1287,10 @@ world.\" with face `md-render-italic' on \"world\"."
         (changed nil))
     (goto-char (point-min))
     (while (re-search-forward
-            (rx (or (seq (or bol (one-or-more (any "\n \t")))
-                         (group "*" (group (one-or-more (not (any "\n*")))) "*"))
-                    (seq (or bol (one-or-more (any "\n \t")))
-                         (group "_" (group (one-or-more (not (any "\n_")))) "_")
+            (rx (or (seq (or bol (one-or-more (char "\n \t")))
+                         (group "*" (group (one-or-more (not (char "\n*")))) "*"))
+                    (seq (or bol (one-or-more (char "\n \t")))
+                         (group "_" (group (one-or-more (not (char "\n_")))) "_")
                          (or (syntax punctuation) (syntax whitespace) line-end))))
             nil t)
       (let* ((markup-start (or (match-beginning 1) (match-beginning 3)))
@@ -1328,7 +1331,7 @@ For example, the buffer \"a ~~b~~ c\" becomes \"a b c\" with face
         (changed nil))
     (goto-char (point-min))
     (while (re-search-forward
-            (rx "~~" (group (one-or-more (not (any "\n~")))) "~~")
+            (rx "~~" (group (one-or-more (not (char "\n~")))) "~~")
             nil t)
       (let* ((markup-start (match-beginning 0))
              (markup-end (match-end 0))
@@ -1426,7 +1429,7 @@ with face `md-render-header-2' on \"My title\"."
     (while (re-search-forward
             (rx bol (zero-or-more blank) (group (one-or-more "#"))
                 (one-or-more blank)
-                (group (one-or-more (not (any "\n")))) "\n")
+                (group (one-or-more (not (char "\n")))) "\n")
             nil t)
       (let* ((markup-start (match-beginning 0))
              (markup-end (match-end 0))
@@ -1519,11 +1522,11 @@ in any match — read the URL from whichever did."
   (rx-to-string
    `(seq ,@(when as-image? '("!"))
          "["
-         (group (,(if as-image? 'zero-or-more 'one-or-more) (not (any "]"))))
+         (group (,(if as-image? 'zero-or-more 'one-or-more) (not (char "]"))))
          "]"
          "("
-         (or (seq "<" (group (zero-or-more (not (any "<" ">" "\n")))) ">")
-             (group (one-or-more (not (any ")")))))
+         (or (seq "<" (group (zero-or-more (not (char "<" ">" "\n")))) ">")
+             (group (one-or-more (not (char ")")))))
          ")")
    t))
 
@@ -1811,7 +1814,7 @@ untouched."
             (goto-char callout-end)
             (while (looking-at
                     (rx bol (zero-or-more blank) ">"
-                        (zero-or-more (not (any "\n"))) "\n"))
+                        (zero-or-more (not (char "\n"))) "\n"))
               (goto-char (match-end 0)))
             (setq callout-end (point)))
           (add-face-text-property callout-start callout-end
@@ -1867,8 +1870,8 @@ left untouched."
     (goto-char (point-min))
     (while (re-search-forward
             (rx bol (zero-or-more blank)
-                ">" (zero-or-more (any " \t>"))
-                (zero-or-more (not (any "\n"))) "\n")
+                ">" (zero-or-more (char " \t>"))
+                (zero-or-more (not (char "\n"))) "\n")
             nil t)
       (let* ((line-start (match-beginning 0))
              (line-end (match-end 0))
@@ -1897,8 +1900,10 @@ left untouched."
   "Return a usable display width for divider rendering.
 Tries the selected window's body width and falls back to 80
 characters when no usable window is available (e.g. batch)."
-  (or (ignore-errors (window-body-width))
-      80))
+  (let ((window (selected-window)))
+    (if (window-live-p window)
+        (window-body-width window)
+      80)))
 
 (cl-defun md-render--style-source-blocks (&key (highlight-blocks t))
   "Strip fenced code block markup and syntax-highlight the body.
@@ -2209,16 +2214,16 @@ responsibility of the mode that owns the rendered view."
 
 (defconst md-render--table-line-regexp
   (rx line-start
-      (zero-or-more (any " \t"))
+      (zero-or-more (char " \t"))
       "|"
-      (one-or-more (not (any "\n")))
+      (one-or-more (not (char "\n")))
       "|"
-      (zero-or-more (any " \t"))
+      (zero-or-more (char " \t"))
       line-end)
   "Regexp matching a single line of a markdown table.")
 
 (defconst md-render--table-pending-line-regexp
-  (rx line-start (zero-or-more (any " \t")) "|")
+  (rx line-start (zero-or-more (char " \t")) "|")
   "Match a line that might still be streaming into a table row.
 This accepts anything starting with `|' after optional leading
 whitespace.  It lets `--extending-table-start' back the watermark
@@ -2227,11 +2232,11 @@ grown its closing `|' yet.")
 
 (defconst md-render--table-separator-regexp
   (rx line-start
-      (zero-or-more (any " \t"))
+      (zero-or-more (char " \t"))
       "|"
       (one-or-more (or "-" ":" "|" " " "\t"))
       "|"
-      (zero-or-more (any " \t"))
+      (zero-or-more (char " \t"))
       line-end)
   "Regexp matching a table separator row (e.g. `|---|---|').")
 
@@ -2391,11 +2396,11 @@ are still parsed as cell separators."
   (let ((cells '()))
     (save-excursion
       (goto-char start)
-      (when (looking-at (rx (zero-or-more (any " \t")) "|"))
+      (when (looking-at (rx (zero-or-more (char " \t")) "|"))
         (goto-char (match-end 0)))
       (let ((cell-start (point)))
         (while (< (point) end)
-          (if (re-search-forward (rx (any "|\\")) end t)
+          (if (re-search-forward (rx (char "|\\")) end t)
               (let ((ch (char-before))
                     (pipe-pos (1- (point))))
                 (cond
@@ -3618,7 +3623,7 @@ For example:
                        (or (match-string 2 url) (match-string 3 url))))
                 ((string-match
                   (rx bos "file:"
-                      (group (not (any "/")) (+? anything))
+                      (group (not (char "/")) (+? anything))
                       (optional (or (seq "#L" (group (one-or-more digit)))
                                     (seq ":" (group (one-or-more digit)))))
                       eos)
@@ -3628,7 +3633,7 @@ For example:
                 ((string-match
                   (rx bos
                       (group (? (optional "/") alpha ":/")
-                             (one-or-more (not (any ":#"))))
+                             (one-or-more (not (char ":#"))))
                       "#L" (group (one-or-more digit))
                       eos)
                   url)
@@ -3636,7 +3641,7 @@ For example:
                 ((string-match
                   (rx bos
                       (group (? (optional "/") alpha ":/")
-                             (one-or-more (not (any ":#"))))
+                             (one-or-more (not (char ":#"))))
                       ":" (group (one-or-more digit))
                       eos)
                   url)

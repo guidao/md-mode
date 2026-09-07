@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 LuciusChen
 
-;; Author: LuciusChen
+;; Author: LuciusChen <https://github.com/yibie>
 ;; Assisted-by: Codex:gpt-5.5
 ;; URL: https://github.com/yibie/md-mode
 ;; Version: 0.4.0
