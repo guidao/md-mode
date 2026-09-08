@@ -3171,11 +3171,13 @@ The rendered chars carry:
     padding, borders, and cell fonts aligned even under
     `variable-pitch-mode' (mirrors the source view's rule).
   - `md-render-frozen t' — so subsequent passes skip them.
-  - `md-render-table-source SOURCE' — the original markdown
-    source, stashed so a future `md-render-replace-markup'
-    call can combine it with freshly-streamed rows that arrive
+  - `md-render-table-source SOURCE' — table rows with rendered
+    inline content and its text properties, so a subsequent
+    `md-render-replace-markup' call can combine it with new rows that arrive
     right after, then re-render the whole table with updated
     column widths.
+  - `md-render-source' — the fully reconstructed Markdown, including
+    inline markup, for lossless source restoration.
 
 Caller-set text properties at the table's start position (e.g.,
 `read-only', application-specific tags like an agent-shell block
@@ -3188,6 +3190,9 @@ rendered region from inheriting either of our two properties."
   (let* ((source (map-elt table :source))
          (table-start (map-elt table :start))
          (table-end (map-elt table :end))
+         ;; Inline passes have already removed delimiters from SOURCE.
+         ;; Flatten their source annotations before replacing the table.
+         (original (md-render-reconstruct table-start table-end))
          ;; Capture the destination window for pixel-accurate
          ;; measurement of non-ASCII cells.  This is the window into
          ;; which we're rendering; the render-table-source helper
@@ -3212,10 +3217,7 @@ rendered region from inheriting either of our two properties."
        table-start end
        `(md-render-frozen t
                                      md-render-table-source ,source
-                                     ;; Mirror the source under the generic property that
-                                     ;; `md-render-reconstruct' reads, so tables reconstruct
-                                     ;; the same way every other block does.
-                                     md-render-source ,source
+                                     md-render-source ,original
                                      rear-nonsticky (md-render-frozen
                                                      md-render-table-source
                                                      md-render-source))))))

@@ -1729,6 +1729,75 @@ character per line."
         ;; remeasurement inside the per-cell loop.
         (should (< measurements 2500))))))
 
+(ert-deftest md-mode-render-preserves-reading-position ()
+  (dolist (command '(md-mode-render md-mode-toggle-markup))
+    (dolist (target '("Top" "Current" "Last"))
+      (with-temp-buffer
+        (insert "# Top\n\nCurrent paragraph with **bold**.\n\n"
+                "| a |\n|---|\n| b |\n\nLast paragraph.\n")
+        (md-mode)
+        (goto-char (point-min))
+        (search-forward target)
+        (backward-char (length target))
+        (funcall command)
+        (should md-mode--rendered-p)
+        (should (looking-at-p target))))))
+
+(ert-deftest md-mode-render-preserves-start-of-buffer ()
+  (with-temp-buffer
+    (insert "# Top\n\n| a |\n|---|\n| b |\n")
+    (md-mode)
+    (goto-char (point-min))
+    (md-mode-toggle-markup)
+    (should (= (point) (point-min)))))
+
+(ert-deftest md-mode-render-keeps-point-near-replaced-table ()
+  (with-temp-buffer
+    (insert "# Top\n\n| a |\n|---|\n| b |\n\nLast paragraph.\n")
+    (md-mode)
+    (goto-char (point-min))
+    (search-forward "| b")
+    (md-mode-render)
+    (should (get-text-property (point) 'md-render-table-source))))
+
+(ert-deftest md-mode-table-inline-markup-roundtrip ()
+  (dolist (modified '(nil t))
+    (with-temp-buffer
+      (let ((source (concat "| a | b |\n|---|---|\n"
+                            "| `code` | **bold** |\n"
+                            "| *it* | [link](http://x) |\n")))
+        (insert source)
+        (md-mode)
+        (set-buffer-modified-p modified)
+        (dotimes (_ 2)
+          (md-mode-toggle-markup)
+          (should md-mode--rendered-p)
+          (should md-mode--table-widgets)
+          (should (md-mode-tests--has-face-p "code" 'md-render-inline-code))
+          (should (md-mode-tests--has-face-p "bold" 'md-render-bold))
+          (should (md-mode-tests--has-face-p "link" 'md-render-link))
+          (should (eq (buffer-modified-p) modified))
+          (md-mode-toggle-markup)
+          (should-not md-mode--rendered-p)
+          (should-not buffer-read-only)
+          (should (eq (buffer-modified-p) modified))
+          (should (equal (buffer-string) source)))))))
+
+(ert-deftest md-mode-table-inline-markup-survives-relayout-and-refresh ()
+  (with-temp-buffer
+    (let ((source "| **a** |\n|---|\n| [**link**](http://x) and `code` |\n"))
+      (insert source)
+      (md-mode)
+      (set-buffer-modified-p nil)
+      (md-mode-render)
+      (save-window-excursion
+        (switch-to-buffer (current-buffer))
+        (md-mode--refresh-table-widget-layout t))
+      (md-mode-refresh-render)
+      (md-mode-show-source)
+      (should (equal (buffer-string) source))
+      (should-not (buffer-modified-p)))))
+
 (ert-deftest md-mode-render-rebuilds-table-widget ()
   (with-temp-buffer
     (insert "| A | B |\n| --- | --- |\n| C | D |\n")
@@ -1989,12 +2058,93 @@ character per line."
           (set-buffer-modified-p t)
           (md-mode-render)
           (save-buffer)
-          (should-not md-mode--rendered-p)
+          (should md-mode--rendered-p)
+          (should buffer-read-only)
+          (should-not (buffer-modified-p))
           (should
            (equal (with-temp-buffer
                     (insert-file-contents file)
                     (buffer-string))
                   md-mode-tests--source)))
+      (delete-file file))))
+
+(ert-deftest md-mode-table-inline-markup-save-writes-source ()
+  (dolist (rendered '(nil t))
+    (let ((file (make-temp-file "md-mode-table-test-" nil ".md"))
+          (source (concat "| a | b |\n|---|---|\n"
+                          "| `code` | **bold** |\n"
+                          "| *it* | [link](http://x) |\n")))
+      (unwind-protect
+          (with-temp-buffer
+            (insert source)
+            (set-visited-file-name file)
+            (md-mode)
+            (save-buffer)
+            (md-mode-toggle-markup)
+            (md-mode-toggle-markup)
+            (goto-char (point-max))
+            (insert "x\n")
+            (when rendered
+              (md-mode-render))
+            (let ((make-backup-files nil))
+              (save-buffer))
+            (should (eq md-mode--rendered-p rendered))
+            (should-not (buffer-modified-p))
+            (should (equal (with-temp-buffer
+                             (insert-file-contents file)
+                             (buffer-string))
+                           (concat source "x\n"))))
+        (delete-file file)))))
+
+(ert-deftest md-mode-background-save-preserves-rendered-view ()
+  (let ((file (make-temp-file "md-mode-background-save-" nil ".md"))
+        (source (concat "# Heading\n\nCurrent paragraph.\n\n"
+                        "| a |\n|---|\n| [link](http://x) |\n")))
+    (unwind-protect
+        (with-temp-buffer
+          (insert source)
+          (set-visited-file-name file)
+          (md-mode)
+          (goto-char (point-min))
+          (search-forward "Current")
+          (backward-char 7)
+          (md-mode-render)
+          ;; Focus-loss savers such as super-save use basic-save-buffer.
+          (basic-save-buffer)
+          (should md-mode--rendered-p)
+          (should buffer-read-only)
+          (should md-mode--table-widgets)
+          (should (looking-at-p "Current"))
+          (should-not (buffer-modified-p))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string))
+                         source))
+          (md-mode-show-source)
+          (should (equal (buffer-string) source)))
+      (delete-file file))))
+
+(ert-deftest md-mode-failed-save-keeps-source-and-retry-respects-view ()
+  (let ((file (make-temp-file "md-mode-failed-save-" nil ".md")))
+    (unwind-protect
+        (with-temp-buffer
+          (insert md-mode-tests--source)
+          (set-visited-file-name file)
+          (md-mode)
+          (md-mode-render)
+          (cl-letf (((symbol-function 'write-region)
+                     (lambda (&rest _)
+                       (signal 'file-error '("Simulated save failure")))))
+            (should-error (basic-save-buffer) :type 'file-error))
+          (should-not md-mode--rendered-p)
+          (should-not buffer-read-only)
+          (should (buffer-modified-p))
+          (should (equal (buffer-string) md-mode-tests--source))
+          ;; A retry in editable source must not revive stale view state.
+          (basic-save-buffer)
+          (should-not md-mode--rendered-p)
+          (should-not md-mode--render-after-save-p)
+          (should-not (buffer-modified-p)))
       (delete-file file))))
 
 (ert-deftest md-mode-render-ignores-stale-visited-file ()

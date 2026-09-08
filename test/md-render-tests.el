@@ -2122,6 +2122,24 @@ for a fully-selected buffer."
                   "| A | B |\n|---|---|\n| 1 | 2 |\n")
                  "| A | B |\n|---|---|\n| 1 | 2 |\n")))
 
+(ert-deftest md-render-reconstruct-table-inline-markup ()
+  (dolist (cell '("`code`" "**bold**" "*it*" "[link](http://x)"
+                  "[**bold** and `code`](http://x)" "~~gone~~"))
+    (let ((source (format "| %s |\n|---|\n| %s |\n" cell cell)))
+      (should (equal (md-render-tests--roundtrip source) source)))))
+
+(ert-deftest md-render-reconstruct-streamed-table-inline-markup ()
+  (with-temp-buffer
+    (let ((first "| **a** |\n|---|\n| `code` |\n")
+          (second "| [link](http://x) |\n"))
+      (insert first)
+      (md-render-replace-markup)
+      (goto-char (point-max))
+      (insert second)
+      (md-render-replace-markup)
+      (should (equal (md-render-reconstruct (point-min) (point-max))
+                     (concat first second))))))
+
 (ert-deftest md-render-reconstruct-mixed ()
   (let ((markdown (concat "# Title\n\n"
                           "A **bold** paragraph.\n\n"

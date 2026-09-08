@@ -53,6 +53,9 @@
 (defvar-local md-mode--rendered-p nil
   "Non-nil when the current buffer displays rendered Markdown.")
 
+(defvar-local md-mode--render-after-save-p nil
+  "Non-nil when a successful save should restore the rendered view.")
+
 (defvar-local md-mode--table-widgets nil
   "Table widgets attached to the current rendered Markdown view.")
 
@@ -2400,6 +2403,7 @@ one relayout when it ends instead of one per step."
                    position 'md-render-table-source nil (point-max)))
           (let* ((end (next-single-property-change
                        position 'md-render-table-source nil (point-max)))
+                 (original (get-text-property position 'md-render-source))
                  (widget (widget-convert
                           'md-render-table-widget :value source))
                  (rendered (textui-layout-widget widget width))
@@ -2415,7 +2419,7 @@ one relayout when it ends instead of one per step."
              position end
              `(md-render-frozen t
                                 md-render-table-source ,source
-                                md-render-source ,source
+                                md-render-source ,original
                                 rear-nonsticky
                                 (md-render-frozen
                                  md-render-table-source
@@ -2445,6 +2449,7 @@ When FORCE is non-nil, relayout even when the character width is unchanged."
                 (let* ((from (marker-position (widget-get widget :from)))
                        (to (marker-position (widget-get widget :to)))
                        (source (widget-get widget :value))
+                       (original (get-text-property from 'md-render-source))
                        (carried (md-render--carry-properties from))
                        (rendered (textui-layout-widget widget width)))
                   (widget-delete widget)
@@ -2459,7 +2464,7 @@ When FORCE is non-nil, relayout even when the character width is unchanged."
                    from to
                    `(md-render-frozen t
                                       md-render-table-source ,source
-                                      md-render-source ,source
+                                      md-render-source ,original
                                       rear-nonsticky
                                       (md-render-frozen
                                        md-render-table-source
@@ -2496,9 +2501,13 @@ When FORCE is non-nil, relayout even when the character width is unchanged."
         (widen)
         (when font-lock-mode
           (font-lock-ensure))
-        (with-silent-modifications
-          (md-render-replace-markup :force t)
-          (md-mode--attach-table-widgets)))
+        ;; Track point through markup removal instead of leaving it at
+        ;; the renderer's last insertion.  Replaced blocks keep point
+        ;; at their start, near the original reading position.
+        (save-excursion
+          (with-silent-modifications
+            (md-render-replace-markup :force t)
+            (md-mode--attach-table-widgets))))
       (md-mode--set-rendered-p t)
       (md-mode--scale-heading-fallback-font)
       (set-buffer-modified-p modified)
@@ -2532,6 +2541,18 @@ When FORCE is non-nil, relayout even when the character width is unchanged."
       (goto-char (min source-point (point-max)))
       (set-buffer-modified-p modified)
       (md-mode--refresh-toc))))
+
+(defun md-mode--before-save ()
+  "Restore source for saving and remember the current view.
+Reset the pending state on every save, including retries after a failure."
+  (setq md-mode--render-after-save-p md-mode--rendered-p)
+  (md-mode-show-source))
+
+(defun md-mode--after-save ()
+  "Restore the rendered view after a successful save."
+  (when md-mode--render-after-save-p
+    (setq md-mode--render-after-save-p nil)
+    (md-mode-render)))
 
 ;;;###autoload
 (defun md-mode-refresh-render ()
@@ -2613,7 +2634,8 @@ When FORCE is non-nil, relayout even when the character width is unchanged."
             #'md-mode--syntax-propertize-extend-region nil t)
   (add-hook 'after-change-functions #'md-mode--toc-mark-dirty nil t)
   (add-hook 'post-command-hook #'md-mode--toc-refresh-if-dirty nil t)
-  (add-hook 'before-save-hook #'md-mode-show-source nil t)
+  (add-hook 'before-save-hook #'md-mode--before-save nil t)
+  (add-hook 'after-save-hook #'md-mode--after-save t t)
   (add-hook 'before-revert-hook #'md-mode-show-source nil t)
   (add-hook 'change-major-mode-hook #'md-mode-show-source nil t)
   (add-hook 'change-major-mode-hook #'md-mode--stop-table-overflow nil t)
